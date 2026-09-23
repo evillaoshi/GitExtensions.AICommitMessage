@@ -11,21 +11,27 @@ using System.Threading.Tasks;
 namespace GitExtensions.AICommitMessage
 {
     /// <summary>
-    /// Minimal client for the OpenAI-compatible Chat Completions endpoint
-    /// (<c>{baseUrl}/chat/completions</c>). The same shape is accepted by OpenAI, Azure OpenAI,
-    /// OpenRouter, Groq, and local servers such as Ollama, so one code path covers cloud and local.
+    /// Minimal client for OpenAI-compatible endpoints. <c>chat</c> uses the classic Chat Completions API
+    /// (<c>{baseUrl}/chat/completions</c>), <c>response</c> uses the newer Responses API
+    /// (<c>{baseUrl}/responses</c>). Both shapes are accepted by OpenAI, Azure OpenAI, OpenRouter, Groq,
+    /// and local servers such as Ollama, so the caller just picks which one its endpoint speaks.
     /// </summary>
     internal sealed class OpenAiClient
     {
+        internal const string ChatApiType = "chat";
+        internal const string ResponseApiType = "response";
+
         private readonly string _baseUrl;
         private readonly string _apiKey;
         private readonly string _model;
+        private readonly bool _useResponseApi;
 
-        public OpenAiClient(string baseUrl, string apiKey, string model)
+        public OpenAiClient(string baseUrl, string apiKey, string model, string apiType)
         {
             _baseUrl = (baseUrl ?? string.Empty).Trim().TrimEnd('/');
             _apiKey = (apiKey ?? string.Empty).Trim();
             _model = (model ?? string.Empty).Trim();
+            _useResponseApi = string.Equals((apiType ?? string.Empty).Trim(), ResponseApiType, StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
@@ -81,6 +87,13 @@ namespace GitExtensions.AICommitMessage
             EnsureBaseUrl();
             EnsureModel();
 
+            return _useResponseApi
+                ? await CompleteWithResponseApiAsync(systemPrompt, diff, cancellationToken).ConfigureAwait(false)
+                : await CompleteWithChatApiAsync(systemPrompt, diff, cancellationToken).ConfigureAwait(false);
+        }
+
+        private async Task<string> CompleteWithChatApiAsync(string systemPrompt, string diff, CancellationToken cancellationToken)
+        {
             var requestBody = new
             {
                 model = _model,
@@ -88,14 +101,34 @@ namespace GitExtensions.AICommitMessage
                 messages = new object[]
                 {
                     new { role = "system", content = systemPrompt },
-                    new { role = "user", content = "Here is the staged git diff. Write the commit message for it:\n\n" + diff }
+                    new { role = "user", content = UserContent(diff) }
                 }
             };
 
-            string json = JsonSerializer.Serialize(requestBody);
+            string responseText = await PostAsync("/chat/completions", JsonSerializer.Serialize(requestBody), cancellationToken).ConfigureAwait(false);
+            return ExtractChatContent(responseText);
+        }
 
+        private async Task<string> CompleteWithResponseApiAsync(string systemPrompt, string diff, CancellationToken cancellationToken)
+        {
+            var requestBody = new
+            {
+                model = _model,
+                instructions = systemPrompt,
+                input = UserContent(diff)
+            };
+
+            string responseText = await PostAsync("/responses", JsonSerializer.Serialize(requestBody), cancellationToken).ConfigureAwait(false);
+            return ExtractResponseContent(responseText);
+        }
+
+        private static string UserContent(string diff)
+            => "Here is the staged git diff. Write the commit message for it:\n\n" + diff;
+
+        private async Task<string> PostAsync(string path, string json, CancellationToken cancellationToken)
+        {
             using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(90) };
-            using HttpRequestMessage request = new(HttpMethod.Post, _baseUrl + "/chat/completions")
+            using HttpRequestMessage request = new(HttpMethod.Post, _baseUrl + path)
             {
                 Content = new StringContent(json, Encoding.UTF8, "application/json")
             };
@@ -103,7 +136,7 @@ namespace GitExtensions.AICommitMessage
             AddAuthorization(request);
 
             using HttpResponseMessage response = await http.SendAsync(request, cancellationToken).ConfigureAwait(false);
-            string responseText = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            string responseText = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
 
             if (!response.IsSuccessStatusCode)
             {
@@ -111,7 +144,7 @@ namespace GitExtensions.AICommitMessage
                     $"The API returned {(int)response.StatusCode} ({response.ReasonPhrase}).\n\n{Truncate(responseText, 1000)}");
             }
 
-            return ExtractContent(responseText);
+            return responseText;
         }
 
         private void EnsureBaseUrl()
@@ -139,7 +172,46 @@ namespace GitExtensions.AICommitMessage
             }
         }
 
-        private static string ExtractContent(string responseText)
+        // Responses API: the text lives in output[].content[].text ("output_text" parts). Some servers
+        // also expose a convenient top-level output_text, which is preferred when present.
+        private static string ExtractResponseContent(string responseText)
+        {
+            using JsonDocument doc = JsonDocument.Parse(responseText);
+            JsonElement root = doc.RootElement;
+
+            if (root.TryGetProperty("output_text", out JsonElement direct)
+                && direct.ValueKind == JsonValueKind.String
+                && !string.IsNullOrWhiteSpace(direct.GetString()))
+            {
+                return direct.GetString()!.Trim();
+            }
+
+            if (root.TryGetProperty("output", out JsonElement output) && output.ValueKind == JsonValueKind.Array)
+            {
+                foreach (JsonElement item in output.EnumerateArray())
+                {
+                    if (!item.TryGetProperty("content", out JsonElement content) || content.ValueKind != JsonValueKind.Array)
+                    {
+                        continue;
+                    }
+
+                    foreach (JsonElement part in content.EnumerateArray())
+                    {
+                        if (part.TryGetProperty("text", out JsonElement text)
+                            && text.ValueKind == JsonValueKind.String
+                            && !string.IsNullOrWhiteSpace(text.GetString()))
+                        {
+                            return text.GetString()!.Trim();
+                        }
+                    }
+                }
+            }
+
+            throw new InvalidOperationException(
+                "Unexpected API response shape (no output text in the /responses reply):\n\n" + Truncate(responseText, 1000));
+        }
+
+        private static string ExtractChatContent(string responseText)
         {
             using JsonDocument doc = JsonDocument.Parse(responseText);
             JsonElement root = doc.RootElement;

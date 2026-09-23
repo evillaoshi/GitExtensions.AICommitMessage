@@ -67,7 +67,7 @@ covers the host's version. Because of that, a single build can't span generation
 
 | Git Extensions | Runtime | Extensibility | This plugin |
 | --- | --- | --- | --- |
-| **7.x** (current) | .NET 10 | `7.0.x` | **v0.3.2+** — depends on `[7.0.0, 8.0.0)` |
+| **7.x** (current) | .NET 10 | `7.0.x` | **v0.4.0+** — depends on `[7.0.0, 8.0.0)` |
 | 5.2.x | .NET 8 | `< 1.0` | v0.1.x (legacy, still on nuget.org) |
 
 The `[7.0.0, 8.0.0)` range means this release works across the **entire current 7.x line** — every
@@ -95,6 +95,7 @@ Open **Settings → Plugins → AI Commit Message** and fill in the fields:
 | --- | --- |
 | **Enabled** | Master switch. Off by default — turn this on first. |
 | **API base URL** | `https://api.openai.com/v1` (OpenAI), `http://localhost:11434/v1` (Ollama), or any OpenAI-compatible base. |
+| **接口类型** | Dropdown: `chat` (Chat Completions, `/chat/completions`, default) or `response` (Responses API, `/responses`). |
 | **Model** | A non-editable dropdown populated automatically from the configured API `/models` endpoint. |
 | **API key** | Masked. Models are loaded automatically after the URL and key are entered; local servers may leave it blank. |
 | **Max diff size (bytes)** | Dropdown: `10000`, `50000`, or `不限制` (send everything). Default `10000` bytes. |
@@ -141,8 +142,8 @@ nuget.org **Trusted Publishing** (OIDC — no stored API key to manage). One-tim
 3. Tag a version and push it:
 
    ```sh
-   git tag v0.3.2
-   git push origin v0.3.2
+   git tag v0.4.0
+   git push origin v0.4.0
    ```
 
 The workflow fetches the matching Git Extensions binaries, packs the plugin, obtains a short-lived
@@ -153,7 +154,7 @@ To build the package locally instead:
 ```sh
 dotnet pack src/GitExtensions.AICommitMessage/GitExtensions.AICommitMessage.csproj -c Release
 # then, with your own key:
-dotnet nuget push src/GitExtensions.AICommitMessage/bin/Release/GitExtensions.AICommitMessage.0.3.2.nupkg \
+dotnet nuget push src/GitExtensions.AICommitMessage/bin/Release/GitExtensions.AICommitMessage.0.4.0.nupkg \
   -k <YOUR_NUGET_API_KEY> -s https://api.nuget.org/v3/index.json
 ```
 
@@ -166,8 +167,9 @@ A quick tour for the curious — three small files:
   **✨ AI message** `ToolStripButton` into the commit toolbar next to “Commit templates”. The diff
   is read and sent **only** inside the button's click handler — that's the consent boundary.
 - **`GitHelper.cs`** reads the staged diff with `git --no-pager diff --cached --no-color`.
-- **`OpenAiClient.cs`** POSTs the system prompt + diff to `{baseUrl}/chat/completions` and returns
-  `choices[0].message.content`, which is placed into the commit message box.
+- **`OpenAiClient.cs`** POSTs the system prompt + diff to `{baseUrl}/chat/completions` (接口类型
+  `chat`) or `{baseUrl}/responses` (接口类型 `response`), and returns the reply text, which is placed
+  into the commit message box.
 
 ## License
 

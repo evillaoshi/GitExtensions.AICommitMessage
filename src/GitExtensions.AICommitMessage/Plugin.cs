@@ -8,6 +8,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using GitCommands.Settings;
 using GitExtensions.Extensibility.Git;
 using GitExtensions.Extensibility.Plugins;
 using GitExtensions.Extensibility.Settings;
@@ -46,8 +47,20 @@ namespace GitExtensions.AICommitMessage
             "只输出原始提交信息文本：不要 markdown，不要代码围栏，不要\n" +
             "外层引号，前后不要任何评论。";
 
+        private const string ChatApiTypeLabel = "chat";
+        private const string ResponseApiTypeLabel = "response";
+        private static readonly string[] ApiTypeValues = { ChatApiTypeLabel, ResponseApiTypeLabel };
+
         private readonly BoolSetting _enabled = new("Enabled", "Enable AI commit message generation", false);
         private readonly StringSetting _baseUrl = new("API base URL", "API base URL (OpenAI-compatible)", "https://api.openai.com/v1");
+
+        // OpenAI-compatible endpoints expose either the classic Chat Completions API or the newer
+        // Responses API. The choice only changes which endpoint is called and how the reply is parsed.
+        private readonly ChoiceSetting _apiType = new(
+            "API type",
+            "接口类型",
+            new List<string>(ApiTypeValues),
+            ChatApiTypeLabel);
         private readonly PasswordSetting _apiKey = new("API key", "API key", "");
         private readonly List<string> _modelValues = new();
         private readonly ChoiceSetting _model;
@@ -101,6 +114,7 @@ namespace GitExtensions.AICommitMessage
 
             yield return _enabled;
             yield return _baseUrl;
+            yield return _apiType;
             // Keep the API key before the model: entering the endpoint and key can now populate the model list.
             yield return _apiKey;
             yield return _model;
@@ -170,6 +184,24 @@ namespace GitExtensions.AICommitMessage
             {
                 _maxDiffSize[Settings] = "10000";
             }
+
+            string? apiType = _apiType[Settings];
+            if (string.IsNullOrWhiteSpace(apiType)
+                || !ApiTypeValues.Any(value => string.Equals(value, apiType.Trim(), StringComparison.OrdinalIgnoreCase)))
+            {
+                _apiType[Settings] = ChatApiTypeLabel;
+            }
+
+            // An unset BoolSetting renders as a grey three-state box; store the default so the checkbox
+            // is a plain unchecked box (same effective value) at every level.
+            if (_enabled[Settings] is null)
+            {
+                _enabled[Settings] = false;
+            }
+
+            // The "Global for all repositories" level reads its own cache of the settings file, so flush
+            // what we just materialised - otherwise that level would still show empty boxes.
+            DistributedSettings.CreateGlobal().Save();
         }
 
         private void OnModelSourceChanged(object? sender, EventArgs e)
@@ -216,7 +248,7 @@ namespace GitExtensions.AICommitMessage
 
             try
             {
-                OpenAiClient client = new(baseUrl, apiKey, string.Empty);
+                OpenAiClient client = new(baseUrl, apiKey, string.Empty, GetApiType());
                 IReadOnlyList<string> models = await client.GetModelsAsync(cancellation.Token);
                 if (cancellation.IsCancellationRequested
                     || !string.Equals(baseUrl, _baseUrlControl.Text.Trim(), StringComparison.Ordinal)
@@ -302,6 +334,15 @@ namespace GitExtensions.AICommitMessage
                     modelControl.EndUpdate();
                 }
             }
+        }
+
+        // Reads the API type dropdown: "chat" (Chat Completions) or "response" (Responses API).
+        private string GetApiType()
+        {
+            string? value = _apiType.ValueOrDefault(Settings);
+            return string.Equals(value?.Trim(), ResponseApiTypeLabel, StringComparison.OrdinalIgnoreCase)
+                ? ResponseApiTypeLabel
+                : ChatApiTypeLabel;
         }
 
         // Reads the byte budget from the dropdown: a number for the explicit limits, 0 for "不限制".
@@ -490,6 +531,7 @@ namespace GitExtensions.AICommitMessage
             string baseUrl = _baseUrl.ValueOrDefault(Settings) ?? string.Empty;
             string model = _model.ValueOrDefault(Settings) ?? string.Empty;
             string apiKey = _apiKey.ValueOrDefault(Settings) ?? string.Empty;
+            string apiType = GetApiType();
             string systemPrompt = _systemPrompt.ValueOrDefault(Settings) ?? string.Empty;
             if (string.IsNullOrWhiteSpace(systemPrompt))
             {
@@ -521,7 +563,7 @@ namespace GitExtensions.AICommitMessage
             try
             {
                 // Off the UI thread; the continuation resumes on the UI thread to update the form.
-                string message = await Task.Run(() => GenerateAsync(workingDir!, baseUrl, apiKey, model, systemPrompt, maxDiffBytes));
+                string message = await Task.Run(() => GenerateAsync(workingDir!, baseUrl, apiKey, model, systemPrompt, maxDiffBytes, apiType));
                 if (!string.IsNullOrEmpty(message))
                 {
                     SetCommitMessage(form, message);
@@ -546,7 +588,7 @@ namespace GitExtensions.AICommitMessage
             }
         }
 
-        private static async Task<string> GenerateAsync(string workingDir, string baseUrl, string apiKey, string model, string systemPrompt, int maxDiffBytes)
+        private static async Task<string> GenerateAsync(string workingDir, string baseUrl, string apiKey, string model, string systemPrompt, int maxDiffBytes, string apiType)
         {
             string diff = GitHelper.GetStagedDiff(workingDir);
             if (string.IsNullOrWhiteSpace(diff))
@@ -560,7 +602,7 @@ namespace GitExtensions.AICommitMessage
                     + "\n\n[diff truncated to fit the configured byte limit]";
             }
 
-            OpenAiClient client = new(baseUrl, apiKey, model);
+            OpenAiClient client = new(baseUrl, apiKey, model, apiType);
             return await client.CompleteAsync(systemPrompt, diff).ConfigureAwait(false);
         }
 
