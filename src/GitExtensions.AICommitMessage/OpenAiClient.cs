@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -23,16 +25,61 @@ namespace GitExtensions.AICommitMessage
         {
             _baseUrl = (baseUrl ?? string.Empty).Trim().TrimEnd('/');
             _apiKey = (apiKey ?? string.Empty).Trim();
-            _model = string.IsNullOrWhiteSpace(model) ? "gpt-4o-mini" : model.Trim();
+            _model = (model ?? string.Empty).Trim();
+        }
+
+        /// <summary>
+        /// Hard deadline for loading the model list. Applied both to <see cref="HttpClient.Timeout"/> and
+        /// to a linked token, so the wait is bounded even when DNS resolution itself is slow.
+        /// </summary>
+        internal const int ModelListTimeoutSeconds = 6;
+
+        public async Task<IReadOnlyList<string>> GetModelsAsync(CancellationToken cancellationToken = default)
+        {
+            EnsureBaseUrl();
+
+            using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(TimeSpan.FromSeconds(ModelListTimeoutSeconds));
+
+            using HttpClient http = new() { Timeout = TimeSpan.FromSeconds(ModelListTimeoutSeconds) };
+            using HttpRequestMessage request = new(HttpMethod.Get, _baseUrl + "/models");
+            AddAuthorization(request);
+
+            using HttpResponseMessage response = await http.SendAsync(request, deadline.Token).ConfigureAwait(false);
+            string responseText = await response.Content.ReadAsStringAsync(deadline.Token).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new InvalidOperationException(
+                    $"The API returned {(int)response.StatusCode} ({response.ReasonPhrase}) while loading models.\n\n{Truncate(responseText, 1000)}");
+            }
+
+            using JsonDocument doc = JsonDocument.Parse(responseText);
+            if (!doc.RootElement.TryGetProperty("data", out JsonElement data)
+                || data.ValueKind != JsonValueKind.Array)
+            {
+                throw new InvalidOperationException(
+                    "Unexpected API response shape (no data array in /models response):\n\n" + Truncate(responseText, 1000));
+            }
+
+            List<string> models = data.EnumerateArray()
+                .Where(item => item.TryGetProperty("id", out JsonElement id) && id.ValueKind == JsonValueKind.String)
+                .Select(item => item.GetProperty("id").GetString())
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .Select(id => id!)
+                .ToList();
+
+            if (models.Count == 0)
+            {
+                throw new InvalidOperationException("The /models response did not contain any model IDs.");
+            }
+
+            return models;
         }
 
         public async Task<string> CompleteAsync(string systemPrompt, string diff, CancellationToken cancellationToken = default)
         {
-            if (string.IsNullOrWhiteSpace(_baseUrl))
-            {
-                throw new InvalidOperationException(
-                    "API base URL is not configured. Set it in Settings → Plugins → AI Commit Message.");
-            }
+            EnsureBaseUrl();
+            EnsureModel();
 
             var requestBody = new
             {
@@ -53,10 +100,7 @@ namespace GitExtensions.AICommitMessage
                 Content = new StringContent(json, Encoding.UTF8, "application/json")
             };
 
-            if (!string.IsNullOrEmpty(_apiKey))
-            {
-                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
-            }
+            AddAuthorization(request);
 
             using HttpResponseMessage response = await http.SendAsync(request, cancellationToken).ConfigureAwait(false);
             string responseText = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
@@ -68,6 +112,31 @@ namespace GitExtensions.AICommitMessage
             }
 
             return ExtractContent(responseText);
+        }
+
+        private void EnsureBaseUrl()
+        {
+            if (string.IsNullOrWhiteSpace(_baseUrl))
+            {
+                throw new InvalidOperationException(
+                    "API base URL is not configured. Set it in Settings → Plugins → AI Commit Message.");
+            }
+        }
+
+        private void EnsureModel()
+        {
+            if (string.IsNullOrWhiteSpace(_model))
+            {
+                throw new InvalidOperationException("No model is selected. Load the model list and choose a model first.");
+            }
+        }
+
+        private void AddAuthorization(HttpRequestMessage request)
+        {
+            if (!string.IsNullOrEmpty(_apiKey))
+            {
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+            }
         }
 
         private static string ExtractContent(string responseText)

@@ -4,6 +4,8 @@ using System.ComponentModel.Composition;
 using System.Drawing;
 using System.Linq;
 using System.Reflection;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using GitExtensions.Extensibility.Git;
@@ -29,33 +31,54 @@ namespace GitExtensions.AICommitMessage
         private const string ButtonText = "✨ AI message";
 
         private const string DefaultSystemPrompt =
-            "You are a senior software engineer writing a git commit message for the staged diff.\n" +
+            "你是一名资深软件工程师，正在为暂存的 diff 编写 git 提交信息。\n" +
+            "按照以下确切格式编写提交信息：\n" +
             "\n" +
-            "Write the message in this exact shape:\n" +
+            "格式为:  类型: 修改描述(最多40个字符), 结尾不加句号。\n" +
+            "主题行：使用祈使语气，，\n" +
+            "类型： 依据修改内容使用如下关键词：\n" +
+            "feat、fix、refactor、docs、test 等特性描述\n" +
             "\n" +
-            "1. Subject line: imperative mood, at most 50 characters, no trailing period.\n" +
-            "   Use a Conventional Commits prefix when it fits the change, one of:\n" +
-            "   feat, fix, refactor, docs, test, chore, perf, build, ci\n" +
-            "   (example: \"fix: prevent crash when staging an empty file\").\n" +
-            "2. Then exactly one blank line.\n" +
-            "3. Body: explain WHAT changed and, above all, WHY it changed. Hard-wrap\n" +
-            "   every body line at 72 characters. Use \"- \" bullet points when there\n" +
-            "   are several distinct changes.\n" +
-            "\n" +
-            "Guidelines:\n" +
-            "- Infer the intent from the diff; never invent changes that aren't there.\n" +
-            "- For a small, self-explanatory change, a subject line alone is fine.\n" +
-            "- Be concise and specific; avoid filler like \"updated some code\".\n" +
-            "\n" +
-            "Output ONLY the raw commit message text: no markdown, no code fences, no\n" +
-            "surrounding quotes, and no commentary before or after it.";
+            "修改描述：说明改了什么（WHAT），尤其是为什么改（WHY）\n" +
+            "指南：\n" +
+            "从 diff 中推断意图；绝不要编造 diff 中不存在的内容。\n" +
+            "简洁且具体；避免“更新了一些代码”这类空话。\n" +
+            "只输出原始提交信息文本：不要 markdown，不要代码围栏，不要\n" +
+            "外层引号，前后不要任何评论。";
 
         private readonly BoolSetting _enabled = new("Enabled", "Enable AI commit message generation", false);
-        private readonly StringSetting _baseUrl = new("API base URL", "API base URL (OpenAI-compatible, e.g. https://api.openai.com/v1 or http://localhost:11434/v1)", "https://api.openai.com/v1");
-        private readonly StringSetting _model = new("Model", "Model", "gpt-4o-mini");
-        private readonly PasswordSetting _apiKey = new("API key", "API key (leave blank for local servers such as Ollama)", "");
+        private readonly StringSetting _baseUrl = new("API base URL", "API base URL (OpenAI-compatible)", "https://api.openai.com/v1");
+        private readonly PasswordSetting _apiKey = new("API key", "API key", "");
+        private readonly List<string> _modelValues = new();
+        private readonly ChoiceSetting _model;
         private readonly StringSetting _systemPrompt = new("System prompt", "System prompt", DefaultSystemPrompt);
-        private readonly NumberSetting<int> _maxDiffChars = new("Max diff characters", "Max diff characters sent to the model (0 = no limit)", 12000);
+        private const string UnlimitedDiffSizeLabel = "不限制";
+
+        // Byte budget for the staged diff. A dropdown keeps the accepted values explicit; "不限制" means
+        // the whole diff is sent. Default is 10000 bytes (as in 10000 = 10 kB).
+        private readonly ChoiceSetting _maxDiffSize = new(
+            "Max diff size (bytes)",
+            "Max diff size sent to the model, in bytes",
+            new List<string> { "10000", "50000", UnlimitedDiffSizeLabel },
+            "10000");
+
+        // URL and API key use custom text boxes so changes can trigger model discovery. ChoiceSetting
+        // supplies the model's native, non-editable ComboBox through Git Extensions' settings UI.
+        private readonly TextBox _baseUrlControl = new() { Width = 320 };
+        private readonly TextBox _apiKeyControl = new() { Width = 320, UseSystemPasswordChar = true };
+        private readonly Label _modelStatusControl = new()
+        {
+            AutoSize = true,
+            Text = "模型状态：尚未获取模型列表。"
+        };
+        private readonly PseudoSetting _modelStatus;
+        private readonly ToolTip _modelToolTip = new();
+        private readonly System.Windows.Forms.Timer _modelRefreshTimer = new() { Interval = 700 };
+        private CancellationTokenSource? _modelRefreshCancellation;
+
+        // True while the API URL or key has been edited without a successful model list load since.
+        // Generation is refused in that window so a model from the previous endpoint is never sent.
+        private bool _modelListStale;
 
         private IGitModule? _module;
         private bool _idleHooked;
@@ -66,15 +89,22 @@ namespace GitExtensions.AICommitMessage
             Name = "AI Commit Message";
             Description = "Generate a commit message from the staged diff via an OpenAI-compatible API";
             Icon = LoadIcon();
+            _model = new ChoiceSetting("Model", "Model", _modelValues);
+            _modelStatus = new PseudoSetting(_modelStatusControl, "Model status");
+            _modelRefreshTimer.Tick += OnModelRefreshTimerTick;
         }
 
         public override IEnumerable<ISetting> GetSettings()
         {
+            ConfigureSettingsControls();
+
             yield return _enabled;
             yield return _baseUrl;
-            yield return _model;
+            // Keep the API key before the model: entering the endpoint and key can now populate the model list.
             yield return _apiKey;
-            yield return _maxDiffChars;
+            yield return _model;
+            yield return _modelStatus;
+            yield return _maxDiffSize;
 
             // Show the system prompt in a tall, multi-line box so it's readable and editable.
             _systemPrompt.CustomControl = new TextBox
@@ -86,6 +116,204 @@ namespace GitExtensions.AICommitMessage
                 ScrollBars = ScrollBars.Vertical
             };
             yield return _systemPrompt;
+        }
+
+        private void ConfigureSettingsControls()
+        {
+            _baseUrl.CustomControl = _baseUrlControl;
+            _apiKey.CustomControl = _apiKeyControl;
+
+            _baseUrlControl.Text = _baseUrl.ValueOrDefault(Settings) ?? string.Empty;
+            _apiKeyControl.Text = _apiKey.ValueOrDefault(Settings) ?? string.Empty;
+
+            string? configuredModel = _model.ValueOrDefault(Settings)?.Trim();
+            if (!string.IsNullOrWhiteSpace(configuredModel)
+                && !_modelValues.Contains(configuredModel, StringComparer.OrdinalIgnoreCase))
+            {
+                _modelValues.Add(configuredModel);
+            }
+
+            SetModelStatus("模型状态：尚未获取模型列表。");
+            _baseUrlControl.TextChanged -= OnModelSourceChanged;
+            _apiKeyControl.TextChanged -= OnModelSourceChanged;
+            _baseUrlControl.TextChanged += OnModelSourceChanged;
+            _apiKeyControl.TextChanged += OnModelSourceChanged;
+        }
+
+        private void OnModelSourceChanged(object? sender, EventArgs e)
+        {
+            _modelRefreshTimer.Stop();
+            _modelRefreshCancellation?.Cancel();
+            _modelListStale = true;
+
+            if (string.IsNullOrWhiteSpace(_baseUrlControl.Text))
+            {
+                SetModelStatus("模型状态：请先填写 API URL。");
+                return;
+            }
+
+            SetModelStatus("模型状态：等待获取模型列表…");
+            _modelRefreshTimer.Start();
+        }
+
+        private void SetModelStatus(string status)
+        {
+            _modelStatusControl.Text = status;
+        }
+
+        private async void OnModelRefreshTimerTick(object? sender, EventArgs e)
+        {
+            _modelRefreshTimer.Stop();
+            await RefreshModelsAsync();
+        }
+
+        private async Task RefreshModelsAsync()
+        {
+            string baseUrl = _baseUrlControl.Text.Trim();
+            string apiKey = _apiKeyControl.Text.Trim();
+            if (string.IsNullOrWhiteSpace(baseUrl))
+            {
+                SetModelStatus("模型状态：请先填写 API URL。");
+                return;
+            }
+
+            SetModelStatus("模型状态：正在获取模型列表…");
+            _modelRefreshCancellation?.Cancel();
+            CancellationTokenSource cancellation = new();
+            _modelRefreshCancellation = cancellation;
+
+            try
+            {
+                OpenAiClient client = new(baseUrl, apiKey, string.Empty);
+                IReadOnlyList<string> models = await client.GetModelsAsync(cancellation.Token);
+                if (cancellation.IsCancellationRequested
+                    || !string.Equals(baseUrl, _baseUrlControl.Text.Trim(), StringComparison.Ordinal)
+                    || !string.Equals(apiKey, _apiKeyControl.Text.Trim(), StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                string preferredModel = _model.CustomControl?.SelectedItem?.ToString()?.Trim()
+                    ?? _model.ValueOrDefault(Settings)?.Trim()
+                    ?? string.Empty;
+                PopulateModelValues(models, preferredModel);
+                _modelListStale = false;
+                SetModelStatus($"模型状态：已获取 {models.Count} 个可用模型。");
+                if (_model.CustomControl is ComboBox modelControl)
+                {
+                    _modelToolTip.SetToolTip(modelControl, $"已获取 {models.Count} 个可用模型。");
+                }
+            }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+            {
+                // A newer URL or API key change superseded this request.
+            }
+            catch (OperationCanceledException)
+            {
+                SetModelStatus("模型状态：获取模型列表超时（6 秒）。");
+            }
+            catch (TimeoutException)
+            {
+                SetModelStatus("模型状态：获取模型列表超时（6 秒）。");
+            }
+            catch (Exception ex)
+            {
+                if (!cancellation.IsCancellationRequested)
+                {
+                    SetModelStatus("模型状态：获取失败：" + ex.Message);
+                    if (_model.CustomControl is ComboBox modelControl)
+                    {
+                        _modelToolTip.SetToolTip(modelControl, "获取模型失败：" + ex.Message);
+                    }
+                }
+            }
+            finally
+            {
+                if (ReferenceEquals(_modelRefreshCancellation, cancellation))
+                {
+                    _modelRefreshCancellation = null;
+                }
+                cancellation.Dispose();
+            }
+        }
+
+        private void PopulateModelValues(IReadOnlyList<string> models, string preferredModel)
+        {
+            List<string> values = models
+                .Where(model => !string.IsNullOrWhiteSpace(model))
+                .Select(model => model.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(model => model, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (values.Count == 0)
+            {
+                return;
+            }
+
+            _modelValues.Clear();
+            _modelValues.AddRange(values);
+
+            if (_model.CustomControl is ComboBox modelControl)
+            {
+                modelControl.BeginUpdate();
+                try
+                {
+                    modelControl.Items.Clear();
+                    modelControl.Items.AddRange(_modelValues.ToArray());
+                    int selectedIndex = _modelValues.FindIndex(model =>
+                        string.Equals(model, preferredModel, StringComparison.OrdinalIgnoreCase));
+                    modelControl.SelectedIndex = selectedIndex >= 0 ? selectedIndex : 0;
+                }
+                finally
+                {
+                    modelControl.EndUpdate();
+                }
+            }
+        }
+
+        // Reads the byte budget from the dropdown: a number for the explicit limits, 0 for "不限制".
+        private int GetMaxDiffBytes()
+        {
+            string? value = _maxDiffSize.ValueOrDefault(Settings);
+            if (string.IsNullOrWhiteSpace(value)
+                || string.Equals(value.Trim(), UnlimitedDiffSizeLabel, StringComparison.Ordinal))
+            {
+                return 0;
+            }
+
+            return int.TryParse(value.Trim(), out int bytes) && bytes > 0 ? bytes : 0;
+        }
+
+        // Cuts the text so the UTF-8 byte count fits the budget without splitting a surrogate pair.
+        private static string TruncateToUtf8Bytes(string text, int maxBytes)
+        {
+            if (maxBytes <= 0 || Encoding.UTF8.GetByteCount(text) <= maxBytes)
+            {
+                return text;
+            }
+
+            int low = 0;
+            int high = text.Length;
+            while (low < high)
+            {
+                int mid = low + ((high - low + 1) / 2);
+                if (Encoding.UTF8.GetByteCount(text, 0, mid) <= maxBytes)
+                {
+                    low = mid;
+                }
+                else
+                {
+                    high = mid - 1;
+                }
+            }
+
+            if (low > 0 && char.IsHighSurrogate(text[low - 1]))
+            {
+                low--;
+            }
+
+            return text.Substring(0, low);
         }
 
         public override void Register(IGitUICommands gitUiCommands)
@@ -101,6 +329,8 @@ namespace GitExtensions.AICommitMessage
             gitUiCommands.PreCommit -= OnPreCommit;
             gitUiCommands.PostCommit -= OnPostCommit;
             UnhookIdle();
+            _modelRefreshTimer.Stop();
+            _modelRefreshCancellation?.Cancel();
             base.Unregister(gitUiCommands);
         }
 
@@ -225,16 +455,33 @@ namespace GitExtensions.AICommitMessage
             }
 
             // Read settings on the UI thread.
-            string baseUrl = _baseUrl.ValueOrDefault(Settings);
-            string model = _model.ValueOrDefault(Settings);
-            string apiKey = _apiKey.ValueOrDefault(Settings);
-            string systemPrompt = _systemPrompt.ValueOrDefault(Settings);
+            string baseUrl = _baseUrl.ValueOrDefault(Settings) ?? string.Empty;
+            string model = _model.ValueOrDefault(Settings) ?? string.Empty;
+            string apiKey = _apiKey.ValueOrDefault(Settings) ?? string.Empty;
+            string systemPrompt = _systemPrompt.ValueOrDefault(Settings) ?? string.Empty;
             if (string.IsNullOrWhiteSpace(systemPrompt))
             {
                 systemPrompt = DefaultSystemPrompt;
             }
 
-            int maxChars = _maxDiffChars.ValueOrDefault(Settings);
+            if (string.IsNullOrWhiteSpace(model))
+            {
+                MessageBox.Show(form,
+                    "请先填写 API URL 和 API Key，等待模型列表加载后选择一个模型。",
+                    Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (_modelListStale)
+            {
+                MessageBox.Show(form,
+                    "模型列表尚未成功获取：API URL 或 API Key 已更改。\n\n"
+                    + "请打开 设置 → 插件 → AI Commit Message，确认模型列表已加载后再生成。",
+                    Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            int maxDiffBytes = GetMaxDiffBytes();
 
             string? originalText = button.Text;
             button.Enabled = false;
@@ -242,7 +489,7 @@ namespace GitExtensions.AICommitMessage
             try
             {
                 // Off the UI thread; the continuation resumes on the UI thread to update the form.
-                string message = await Task.Run(() => GenerateAsync(workingDir!, baseUrl, apiKey, model, systemPrompt, maxChars));
+                string message = await Task.Run(() => GenerateAsync(workingDir!, baseUrl, apiKey, model, systemPrompt, maxDiffBytes));
                 if (!string.IsNullOrEmpty(message))
                 {
                     SetCommitMessage(form, message);
@@ -267,7 +514,7 @@ namespace GitExtensions.AICommitMessage
             }
         }
 
-        private static async Task<string> GenerateAsync(string workingDir, string baseUrl, string apiKey, string model, string systemPrompt, int maxChars)
+        private static async Task<string> GenerateAsync(string workingDir, string baseUrl, string apiKey, string model, string systemPrompt, int maxDiffBytes)
         {
             string diff = GitHelper.GetStagedDiff(workingDir);
             if (string.IsNullOrWhiteSpace(diff))
@@ -275,9 +522,10 @@ namespace GitExtensions.AICommitMessage
                 throw new NoStagedChangesException();
             }
 
-            if (maxChars > 0 && diff.Length > maxChars)
+            if (maxDiffBytes > 0 && Encoding.UTF8.GetByteCount(diff) > maxDiffBytes)
             {
-                diff = diff.Substring(0, maxChars) + "\n\n[diff truncated to fit the configured limit]";
+                diff = TruncateToUtf8Bytes(diff, maxDiffBytes)
+                    + "\n\n[diff truncated to fit the configured byte limit]";
             }
 
             OpenAiClient client = new(baseUrl, apiKey, model);

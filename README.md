@@ -67,7 +67,7 @@ covers the host's version. Because of that, a single build can't span generation
 
 | Git Extensions | Runtime | Extensibility | This plugin |
 | --- | --- | --- | --- |
-| **7.x** (current) | .NET 10 | `7.0.x` | **v0.2.0+** — depends on `[7.0.0, 8.0.0)` |
+| **7.x** (current) | .NET 10 | `7.0.x` | **v0.3.1+** — depends on `[7.0.0, 8.0.0)` |
 | 5.2.x | .NET 8 | `< 1.0` | v0.1.x (legacy, still on nuget.org) |
 
 The `[7.0.0, 8.0.0)` range means this release works across the **entire current 7.x line** — every
@@ -95,10 +95,10 @@ Open **Settings → Plugins → AI Commit Message** and fill in the fields:
 | --- | --- |
 | **Enabled** | Master switch. Off by default — turn this on first. |
 | **API base URL** | `https://api.openai.com/v1` (OpenAI), `http://localhost:11434/v1` (Ollama), or any OpenAI-compatible base. |
-| **Model** | e.g. `gpt-4o-mini`, `gpt-4o`, or your local model name. |
-| **API key** | Masked. Leave blank for local servers that don't require auth. |
-| **Max diff characters** | Truncates the diff before sending (`0` = no limit). Default `12000`. |
-| **System prompt** | Steer the style. The default asks for a Conventional-Commits subject plus a body that explains *why*. |
+| **Model** | A non-editable dropdown populated automatically from the configured API `/models` endpoint. |
+| **API key** | Masked. Models are loaded automatically after the URL and key are entered; local servers may leave it blank. |
+| **Max diff size (bytes)** | Dropdown: `10000`, `50000`, or `不限制` (send everything). Default `10000` bytes. |
+| **System prompt** | Steer the style. The default is Chinese: a single `类型: 修改描述` subject line (≤ 40 chars, no trailing period, `feat`/`fix`/`refactor`/`docs`/`test` …) and nothing else. |
 
 ## Build from source
 
@@ -141,8 +141,8 @@ nuget.org **Trusted Publishing** (OIDC — no stored API key to manage). One-tim
 3. Tag a version and push it:
 
    ```sh
-   git tag v0.2.0
-   git push origin v0.2.0
+   git tag v0.3.1
+   git push origin v0.3.1
    ```
 
 The workflow fetches the matching Git Extensions binaries, packs the plugin, obtains a short-lived
@@ -153,7 +153,7 @@ To build the package locally instead:
 ```sh
 dotnet pack src/GitExtensions.AICommitMessage/GitExtensions.AICommitMessage.csproj -c Release
 # then, with your own key:
-dotnet nuget push src/GitExtensions.AICommitMessage/bin/Release/GitExtensions.AICommitMessage.0.2.0.nupkg \
+dotnet nuget push src/GitExtensions.AICommitMessage/bin/Release/GitExtensions.AICommitMessage.0.3.1.nupkg \
   -k <YOUR_NUGET_API_KEY> -s https://api.nuget.org/v3/index.json
 ```
 
