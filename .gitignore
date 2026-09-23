@@ -5,6 +5,7 @@ obj/
 *.user
 artifacts/
 *.nupkg
+extPath
 
 ## Rider
 .idea/
