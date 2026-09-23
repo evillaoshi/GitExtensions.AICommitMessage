@@ -28,10 +28,10 @@ namespace GitExtensions.AICommitMessage
     public sealed class Plugin : GitPluginBase, IGitPluginForRepository, IGitPluginForCommit
     {
         private const string Title = "AI commit message";
-        private const string ButtonName = "aiCommitMessageButton";
-        private const string ButtonText = "✨ AI message";
-        private const string AiCommitButtonName = "aiCommitStageButton";
-        private const string AiCommitButtonText = "🤖 AI commit";
+        private const string AiMenuName = "aiCommitDropDownButton";
+        private const string AiMenuText = "🤖 AI commit";
+        private const string StageMenuItemText = "生成 stage";
+        private const string MessageMenuItemText = "生成 commit";
 
         private const string DefaultSystemPrompt =
             "你是一名资深软件工程师，正在为暂存的 diff 编写 git 提交信息。\n" +
@@ -494,53 +494,59 @@ namespace GitExtensions.AICommitMessage
                 return;
             }
 
-            AddToolbarButton(
-                host,
-                insertIndex,
-                ButtonName,
-                ButtonText,
-                "Generate a commit message from the staged diff",
-                button => OnGenerateClickedAsync(form, button));
-
-            // Sits right next to the AI message button and drives the stage-then-generate flow.
-            AddToolbarButton(
-                host,
-                insertIndex < 0 ? -1 : insertIndex + 1,
-                AiCommitButtonName,
-                AiCommitButtonText,
-                "Pick one related change, stage it, then generate the commit message",
-                button => OnAiCommitClickedAsync(form, button));
+            AddAiMenu(host, insertIndex, form);
         }
 
-        private void AddToolbarButton(ToolStrip host, int insertIndex, string name, string text, string toolTip, Func<ToolStripButton, Task> onClick)
+        // Mirrors Git Extensions' own "Commit templates" toolbar entry: one drop-down button with the two
+        // AI actions, so the toolbar stays tidy and the choice is explicit.
+        private void AddAiMenu(ToolStrip host, int insertIndex, Form form)
         {
-            // Each button is added at most once - the idle hook can fire again for the same form.
-            if (host.Items.Cast<ToolStripItem>().Any(item => item.Name == name))
+            // Added at most once - the idle hook can fire again for the same form.
+            if (host.Items.Cast<ToolStripItem>().Any(item => item.Name == AiMenuName))
             {
                 return;
             }
 
-            ToolStripButton button = new()
+            ToolStripDropDownButton menu = new()
             {
-                Name = name,
-                Text = text,
+                Name = AiMenuName,
+                Text = AiMenuText,
                 Image = Icon,
                 DisplayStyle = ToolStripItemDisplayStyle.ImageAndText,
-                ToolTipText = toolTip
+                ToolTipText = "AI：先挑选并暂存一组相关改动，或只根据已暂存的改动生成提交信息"
             };
-            button.Click += async (_, _) => await onClick(button).ConfigureAwait(true);
+
+            menu.DropDownItems.Add(CreateMenuItem(
+                StageMenuItemText,
+                "挑选一组相关的未暂存改动，暂存它们之后再生成提交信息",
+                () => OnAiCommitClickedAsync(form, menu)));
+            menu.DropDownItems.Add(CreateMenuItem(
+                MessageMenuItemText,
+                "根据已经暂存的改动生成提交信息",
+                () => OnGenerateClickedAsync(form, menu)));
 
             if (insertIndex >= 0 && insertIndex <= host.Items.Count)
             {
-                host.Items.Insert(insertIndex, button);
+                host.Items.Insert(insertIndex, menu);
             }
             else
             {
-                host.Items.Add(button);
+                host.Items.Add(menu);
             }
         }
 
-        private async Task OnGenerateClickedAsync(Form form, ToolStripButton button)
+        private static ToolStripMenuItem CreateMenuItem(string text, string toolTip, Func<Task> onClick)
+        {
+            ToolStripMenuItem item = new()
+            {
+                Text = text,
+                ToolTipText = toolTip
+            };
+            item.Click += async (_, _) => await onClick().ConfigureAwait(true);
+            return item;
+        }
+
+        private async Task OnGenerateClickedAsync(Form form, ToolStripItem trigger)
         {
             string? workingDir = GetDialogModule(form)?.WorkingDir;
             if (string.IsNullOrEmpty(workingDir))
@@ -578,14 +584,14 @@ namespace GitExtensions.AICommitMessage
 
             int maxDiffBytes = GetMaxDiffBytes();
 
-            string? originalText = button.Text;
-            button.Enabled = false;
-            button.Text = "Generating…";
+            string? originalText = trigger.Text;
+            trigger.Enabled = false;
+            trigger.Text = "Generating…";
             try
             {
                 // Off the UI thread; the continuation resumes on the UI thread to update the form.
                 string message = await Task.Run(() => GenerateAsync(workingDir!, baseUrl, apiKey, model, systemPrompt, maxDiffBytes, apiType));
-                if (form.IsDisposed || button.IsDisposed)
+                if (form.IsDisposed || trigger.IsDisposed)
                 {
                     return;
                 }
@@ -609,10 +615,10 @@ namespace GitExtensions.AICommitMessage
             }
             finally
             {
-                if (!button.IsDisposed)
+                if (!trigger.IsDisposed)
                 {
-                    button.Text = originalText;
-                    button.Enabled = true;
+                    trigger.Text = originalText;
+                    trigger.Enabled = true;
                 }
             }
         }
@@ -622,7 +628,7 @@ namespace GitExtensions.AICommitMessage
         /// list with the user, stage exactly those files, refresh the dialog and fill in the commit message.
         /// Nothing is ever committed automatically.
         /// </summary>
-        private async Task OnAiCommitClickedAsync(Form form, ToolStripButton button)
+        private async Task OnAiCommitClickedAsync(Form form, ToolStripItem trigger)
         {
             // The dialog knows which repository it belongs to; _module is only the last one registered,
             // so with several repository windows open it can point somewhere else entirely.
@@ -661,14 +667,14 @@ namespace GitExtensions.AICommitMessage
                 return;
             }
 
-            string? originalText = button.Text;
-            button.Enabled = false;
-            button.Text = "Analyzing…";
+            string? originalText = trigger.Text;
+            trigger.Enabled = false;
+            trigger.Text = "Analyzing…";
             try
             {
                 int summaryBytes = GetFeatureSummaryBytes();
                 ChangeSet changeSet = await Task.Run(() => GitHelper.GetChangeSet(workingDir!, summaryBytes)).ConfigureAwait(true);
-                if (form.IsDisposed || button.IsDisposed)
+                if (form.IsDisposed || trigger.IsDisposed)
                 {
                     return;
                 }
@@ -696,7 +702,7 @@ namespace GitExtensions.AICommitMessage
                     FeatureSelection selection = await client
                         .SelectFeatureAsync(changeSet.Summary, changeSet.UnstagedPaths)
                         .ConfigureAwait(true);
-                    if (form.IsDisposed || button.IsDisposed)
+                    if (form.IsDisposed || trigger.IsDisposed)
                     {
                         return;
                     }
@@ -712,7 +718,7 @@ namespace GitExtensions.AICommitMessage
                 }
                 catch (Exception ex)
                 {
-                    if (form.IsDisposed || button.IsDisposed)
+                    if (form.IsDisposed || trigger.IsDisposed)
                     {
                         return;
                     }
@@ -751,7 +757,7 @@ namespace GitExtensions.AICommitMessage
                         .Where(entry => entry.HasUnstagedChanges)
                         .Select(entry => entry.Path)
                         .ToList()).ConfigureAwait(true);
-                if (form.IsDisposed || button.IsDisposed)
+                if (form.IsDisposed || trigger.IsDisposed)
                 {
                     return;
                 }
@@ -772,7 +778,7 @@ namespace GitExtensions.AICommitMessage
                     return;
                 }
 
-                button.Text = "Staging…";
+                trigger.Text = "Staging…";
                 IReadOnlyList<GitItemStatus>? knownItems = GetUnstagedItems(form);
 
                 // Staged on the UI thread on purpose: this is exactly what the dialog's own stage buttons
@@ -794,11 +800,11 @@ namespace GitExtensions.AICommitMessage
                         MessageBoxIcon.Information);
                 }
 
-                button.Text = "Generating…";
+                trigger.Text = "Generating…";
                 int maxDiffBytes = GetMaxDiffBytes();
                 string message = await Task.Run(() => GenerateAsync(
                     workingDir!, baseUrl, apiKey, model, systemPrompt, maxDiffBytes, apiType)).ConfigureAwait(true);
-                if (form.IsDisposed || button.IsDisposed)
+                if (form.IsDisposed || trigger.IsDisposed)
                 {
                     return;
                 }
@@ -818,10 +824,10 @@ namespace GitExtensions.AICommitMessage
             }
             finally
             {
-                if (!button.IsDisposed)
+                if (!trigger.IsDisposed)
                 {
-                    button.Text = originalText;
-                    button.Enabled = true;
+                    trigger.Text = originalText;
+                    trigger.Enabled = true;
                 }
             }
         }

@@ -4,10 +4,11 @@
 [Git Extensions](https://github.com/gitextensions/gitextensions) that writes a first-draft commit
 message for you, straight from the changes you've staged.
 
-It adds a **`✨ AI message`** button to the Commit dialog. Click it, and the plugin sends your
-**staged** diff to an AI model of your choice and drops the suggested message into the commit box —
-where you read it, tweak it, and commit. No copy-pasting into a chat window, no leaving Git
-Extensions.
+It adds a **`🤖 AI commit`** drop-down to the Commit dialog, right next to “Commit templates”, with
+two entries. **`生成 commit`** sends your **staged** diff to an AI model of your choice and drops the
+suggested message into the commit box. **`生成 stage`** first picks one related group out of your
+unstaged changes, stages it, and then writes the message — which you read, tweak, and commit. No
+copy-pasting into a chat window, no leaving Git Extensions.
 
 It talks to any **OpenAI-compatible** API — OpenAI, Azure OpenAI, OpenRouter, Groq — or a model
 running **locally** via [Ollama](https://ollama.com/), in which case nothing ever leaves your
@@ -15,16 +16,17 @@ machine.
 
 <img width="820" alt="The ✨ AI message button in the Git Extensions Commit dialog" src="https://github.com/user-attachments/assets/16d7a860-c6ec-46af-964a-2bec811dc26f" />
 
-*The **✨ AI message** button lives in the Commit dialog toolbar, right next to “Commit templates”.*
+*The **`🤖 AI commit`** drop-down lives in the Commit dialog toolbar, right next to
+“Commit templates”.*
 
-It also adds a **`🤖 AI commit`** button for when the working tree is a mess: it asks the model to
-pick **one** related group out of your unstaged changes, shows you the file list, stages exactly the
-files you confirm, and then fills in the commit message. The commit itself is still yours to make.
+**`生成 stage`** is for when the working tree is a mess: it asks the model to pick **one** related
+group out of your unstaged changes, shows you the file list, stages exactly the files you confirm,
+and then fills in the commit message. The commit itself is still yours to make.
 
 ## How it feels to use
 
 1. Stage the changes you want to commit, as usual.
-2. Open the **Commit** dialog and click **`✨ AI message`**.
+2. Open the **Commit** dialog and pick **`🤖 AI commit` → `生成 commit`**.
 3. The plugin reads your staged diff and asks your model for a message. A second or two later the
    suggestion appears in the message box.
 4. Edit anything you like, then commit.
@@ -42,7 +44,8 @@ instruction to match your team's style (see the **System prompt** setting below)
 
 Working tree full of unrelated edits? **`🤖 AI commit`** carves out one coherent commit for you:
 
-1. Click **`🤖 AI commit`** in the Commit dialog (needs the plugin enabled and a model selected).
+1. Pick **`🤖 AI commit` → `生成 stage`** in the Commit dialog (needs the plugin enabled and a model
+   selected).
 2. The plugin sends the model a **summary of your changes** — staged and unstaged file names with
    `+/-` counts, plus a short excerpt (about the first 40 lines) of each unstaged file — and asks
    which of them belong to a single feature.
@@ -62,8 +65,8 @@ This plugin is built around the concerns raised on that original issue. You stay
 - **Off by default.** Nothing happens until you switch it on in settings *and* click the button.
 - **Explicit consent, every single time.** Your diff is sent **only when you click the button** —
   never automatically, never when the dialog opens, never in the background.
-- **Only *staged* content is sent** — with one exception. `✨ AI message` sends `git diff --cached`.
-  `🤖 AI commit` must look at your unstaged changes first, so it sends their **file names, `+/-`
+- **Only *staged* content is sent** — with one exception. `生成 commit` sends `git diff --cached`.
+  `生成 stage` must look at your unstaged changes first, so it sends their **file names, `+/-`
   counts and a short excerpt of each** (see [AI commit](#ai-commit-stage-one-related-change)); the
   excerpt budget is a setting. Either way, files ignored by `.gitignore` are never included.
 - **Your key, your endpoint.** You bring your own API key — or point it at a local Ollama model so
@@ -90,7 +93,7 @@ covers the host's version. Because of that, a single build can't span generation
 
 | Git Extensions | Runtime | Extensibility | This plugin |
 | --- | --- | --- | --- |
-| **7.x** (current) | .NET 10 | `7.0.x` | **v0.5.0+** — depends on `[7.0.0, 8.0.0)` |
+| **7.x** (current) | .NET 10 | `7.0.x` | **v0.5.1+** — depends on `[7.0.0, 8.0.0)` |
 | 5.2.x | .NET 8 | `< 1.0` | v0.1.x (legacy, still on nuget.org) |
 
 The `[7.0.0, 8.0.0)` range means this release works across the **entire current 7.x line** — every
@@ -122,7 +125,7 @@ Open **Settings → Plugins → AI Commit Message** and fill in the fields:
 | **Model** | A non-editable dropdown populated automatically from the configured API `/models` endpoint. |
 | **API key** | Masked. Models are loaded automatically after the URL and key are entered; local servers may leave it blank. |
 | **Max diff size (bytes)** | Dropdown: `10000`, `50000`, or `不限制` (send everything). Default `10000` bytes. |
-| **AI 分组摘要上限（字节）** | Only used by `🤖 AI commit`: caps how much of the unstaged-change summary is sent when picking a group. Dropdown: `8000`, `20000`, or `不限制`. Default `8000` bytes. |
+| **AI 分组摘要上限（字节）** | Only used by `生成 stage`: caps how much of the unstaged-change summary is sent when picking a group. Dropdown: `8000`, `20000`, or `不限制`. Default `8000` bytes. |
 | **System prompt** | Steer the style. The default is Chinese: a single `类型: 修改描述` subject line (≤ 40 chars, no trailing period, `feat`/`fix`/`refactor`/`docs`/`test` …) and nothing else. |
 
 ## Build from source
@@ -166,8 +169,8 @@ nuget.org **Trusted Publishing** (OIDC — no stored API key to manage). One-tim
 3. Tag a version and push it:
 
    ```sh
-   git tag v0.5.0
-   git push origin v0.5.0
+   git tag v0.5.1
+   git push origin v0.5.1
    ```
 
 The workflow fetches the matching Git Extensions binaries, packs the plugin, obtains a short-lived
@@ -178,7 +181,7 @@ To build the package locally instead:
 ```sh
 dotnet pack src/GitExtensions.AICommitMessage/GitExtensions.AICommitMessage.csproj -c Release
 # then, with your own key:
-dotnet nuget push src/GitExtensions.AICommitMessage/bin/Release/GitExtensions.AICommitMessage.0.5.0.nupkg \
+dotnet nuget push src/GitExtensions.AICommitMessage/bin/Release/GitExtensions.AICommitMessage.0.5.1.nupkg \
   -k <YOUR_NUGET_API_KEY> -s https://api.nuget.org/v3/index.json
 ```
 
@@ -188,9 +191,9 @@ A quick tour for the curious — three small files:
 
 - **`Plugin.cs`** exports `IGitPlugin` / `IGitPluginForCommit` via MEF. When the Commit dialog opens
   (and only if the plugin is enabled) it waits for the form to appear, then injects the
-  **✨ AI message** and **🤖 AI commit** `ToolStripButton`s into the commit toolbar next to
-  “Commit templates”. Everything is read and sent **only** inside those click handlers — that's the
-  consent boundary.
+  a **`🤖 AI commit`** drop-down (`生成 stage` / `生成 commit`) into the commit toolbar next to
+  “Commit templates”, mirroring Git Extensions' own template menu. Everything is read and sent
+  **only** inside those click handlers — that's the consent boundary.
 - **`GitHelper.cs`** reads the staged diff with `git --no-pager diff --cached --no-color`, and builds
   the size-bounded change summary (`status --porcelain=v1 -z`, `diff --numstat`, short excerpts) that
   `🤖 AI commit` sends when asking for a group.
