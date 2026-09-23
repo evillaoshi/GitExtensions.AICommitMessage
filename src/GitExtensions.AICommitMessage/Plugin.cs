@@ -53,13 +53,14 @@ namespace GitExtensions.AICommitMessage
         private readonly ChoiceSetting _model;
         private readonly StringSetting _systemPrompt = new("System prompt", "System prompt", DefaultSystemPrompt);
         private const string UnlimitedDiffSizeLabel = "不限制";
+        private static readonly string[] MaxDiffSizeValues = { "10000", "50000", UnlimitedDiffSizeLabel };
 
         // Byte budget for the staged diff. A dropdown keeps the accepted values explicit; "不限制" means
         // the whole diff is sent. Default is 10000 bytes (as in 10000 = 10 kB).
         private readonly ChoiceSetting _maxDiffSize = new(
             "Max diff size (bytes)",
             "Max diff size sent to the model, in bytes",
-            new List<string> { "10000", "50000", UnlimitedDiffSizeLabel },
+            new List<string>(MaxDiffSizeValues),
             "10000");
 
         // URL and API key use custom text boxes so changes can trigger model discovery. ChoiceSetting
@@ -113,13 +114,19 @@ namespace GitExtensions.AICommitMessage
                 Height = 160,
                 WordWrap = true,
                 AcceptsReturn = true,
-                ScrollBars = ScrollBars.Vertical
+                ScrollBars = ScrollBars.Vertical,
+
+                // Pre-fill from the effective value as well, so the box never shows up blank even if the
+                // host does not feed the control through its binding.
+                Text = _systemPrompt.ValueOrDefault(Settings)
             };
             yield return _systemPrompt;
         }
 
         private void ConfigureSettingsControls()
         {
+            EnsureSettingDefaults();
+
             _baseUrl.CustomControl = _baseUrlControl;
             _apiKey.CustomControl = _apiKeyControl;
 
@@ -138,6 +145,31 @@ namespace GitExtensions.AICommitMessage
             _apiKeyControl.TextChanged -= OnModelSourceChanged;
             _baseUrlControl.TextChanged += OnModelSourceChanged;
             _apiKeyControl.TextChanged += OnModelSourceChanged;
+        }
+
+        // Git Extensions hosts plugin settings at SettingLevel.Unknown (the AppSettings container), and
+        // the control bindings there load the STORED value only: a setting that was never saved renders as
+        // an empty field even though its declared default is what generation actually uses. Persist those
+        // defaults once so the settings page shows the real values. The model list deliberately has no
+        // default, so it stays empty until the API returns models.
+        private void EnsureSettingDefaults()
+        {
+            if (string.IsNullOrWhiteSpace(_baseUrl[Settings]))
+            {
+                _baseUrl[Settings] = "https://api.openai.com/v1";
+            }
+
+            if (string.IsNullOrWhiteSpace(_systemPrompt[Settings]))
+            {
+                _systemPrompt[Settings] = DefaultSystemPrompt;
+            }
+
+            string? diffSize = _maxDiffSize[Settings];
+            if (string.IsNullOrWhiteSpace(diffSize)
+                || !MaxDiffSizeValues.Any(value => string.Equals(value, diffSize.Trim(), StringComparison.Ordinal)))
+            {
+                _maxDiffSize[Settings] = "10000";
+            }
         }
 
         private void OnModelSourceChanged(object? sender, EventArgs e)
