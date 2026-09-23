@@ -1,5 +1,63 @@
 # GitExtensions.AICommitMessage
 
+## Build environment (quick reference)
+
+What the container that builds this project does, in order. A .NET 10 SDK plus a couple of system
+packages is all it takes — the plugin has no NuGet dependencies of its own.
+
+### Linux (headless Debian 13 / Ubuntu container)
+
+```sh
+git clone https://github.com/evillaoshi/GitExtensions.AICommitMessage
+cd GitExtensions.AICommitMessage
+
+# 1) .NET 10 SDK. The distro package (apt install dotnet-sdk-10.0) did not exist in this container,
+#    so the official installer is used instead:
+curl -L https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+chmod +x /tmp/dotnet-install.sh
+/tmp/dotnet-install.sh --channel 10.0
+export PATH="$HOME/.dotnet:$PATH"          # put this in ~/.bashrc to make it stick
+
+# 2) The .NET runtime needs ICU on Debian/Ubuntu:
+apt update && apt install -y libicu76
+
+# 3) Build. net10.0-windows on Linux needs Windows targeting, and the host assemblies must be
+#    pointed at explicitly (the default is C:\Program Files\GitExtensions):
+dotnet build src/GitExtensions.AICommitMessage/GitExtensions.AICommitMessage.csproj \
+  -c Release \
+  -p:EnableWindowsTargeting=true \
+  -p:GitExtensionsPath="$(pwd)/extPath"
+```
+
+### Windows
+
+```sh
+dotnet build src/GitExtensions.AICommitMessage/GitExtensions.AICommitMessage.csproj -c Release
+```
+
+`GitExtensionsPath` defaults to `C:\Program Files\GitExtensions`; add
+`-p:GitExtensionsPath="D:\path\to\GitExtensions"` when yours lives elsewhere.
+
+### Where the build output lands
+
+```
+src/GitExtensions.AICommitMessage/bin/Release/net10.0-windows/GitExtensions.AICommitMessage.dll
+```
+
+### Notes
+
+- **`extPath/` is git-ignored** (see `.gitignore`), so a fresh clone does not contain it. It holds the
+  Git Extensions assemblies this plugin compiles against: `GitExtensions.dll`,
+  `GitExtensions.Extensibility.dll`, `GitCommands.dll`, `GitUIPluginInterfaces.dll`,
+  `ResourceManager.dll`, `System.ComponentModel.Composition.dll`. Copy them from your Git Extensions
+  installation into `extPath/`, or skip the folder and point `-p:GitExtensionsPath=` at that
+  installation.
+- `-p:EnableWindowsTargeting=true` is only needed when building on Linux/macOS; on Windows the plain
+  command above is enough.
+- A Linux build prints one harmless warning, `MSB3245` for `GitExtUtils`, because that assembly is not
+  part of `extPath` — the plugin references the host assemblies with `Private=false`, so the build
+  output is just the plugin DLL and Git Extensions supplies the rest at runtime.
+
 **Stop staring at a blank commit message.** This is a plugin for
 [Git Extensions](https://github.com/gitextensions/gitextensions) that writes a first-draft commit
 message for you, straight from the changes you've staged.
@@ -93,7 +151,7 @@ covers the host's version. Because of that, a single build can't span generation
 
 | Git Extensions | Runtime | Extensibility | This plugin |
 | --- | --- | --- | --- |
-| **7.x** (current) | .NET 10 | `7.0.x` | **v0.5.1+** — depends on `[7.0.0, 8.0.0)` |
+| **7.x** (current) | .NET 10 | `7.0.x` | **v0.5.2+** — depends on `[7.0.0, 8.0.0)` |
 | 5.2.x | .NET 8 | `< 1.0` | v0.1.x (legacy, still on nuget.org) |
 
 The `[7.0.0, 8.0.0)` range means this release works across the **entire current 7.x line** — every
@@ -169,8 +227,8 @@ nuget.org **Trusted Publishing** (OIDC — no stored API key to manage). One-tim
 3. Tag a version and push it:
 
    ```sh
-   git tag v0.5.1
-   git push origin v0.5.1
+   git tag v0.5.2
+   git push origin v0.5.2
    ```
 
 The workflow fetches the matching Git Extensions binaries, packs the plugin, obtains a short-lived
@@ -181,7 +239,7 @@ To build the package locally instead:
 ```sh
 dotnet pack src/GitExtensions.AICommitMessage/GitExtensions.AICommitMessage.csproj -c Release
 # then, with your own key:
-dotnet nuget push src/GitExtensions.AICommitMessage/bin/Release/GitExtensions.AICommitMessage.0.5.1.nupkg \
+dotnet nuget push src/GitExtensions.AICommitMessage/bin/Release/GitExtensions.AICommitMessage.0.5.2.nupkg \
   -k <YOUR_NUGET_API_KEY> -s https://api.nuget.org/v3/index.json
 ```
 
