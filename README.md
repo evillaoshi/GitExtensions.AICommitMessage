@@ -1,5 +1,35 @@
 # GitExtensions.AICommitMessage
 
+## What's new
+
+The AI entry point is a single drop-down in the Commit dialog, and the settings were rebuilt around
+it:
+
+- **`🤖 AI commit` drop-down**, next to “Commit templates”, with two actions:
+  - **`生成 stage`** — the model picks **one** related group out of your *unstaged* changes, you
+    confirm the file list, the plugin stages exactly those files, refreshes the dialog and then
+    writes the commit message. Nothing is ever committed for you.
+  - **`生成 commit`** — writes the message from the **already staged** diff (the previous
+    `✨ AI message` behaviour).
+- **Model is a non-editable drop-down** fed by `GET {baseUrl}/models`: fill in the URL and API key and
+  the list loads by itself (hard 6 s timeout, status shown right below the field). There is no default
+  model, so generation waits until you choose one.
+- **New setting `接口类型`** — `chat` (Chat Completions, `/chat/completions`, default) or `response`
+  (Responses API, `/responses`).
+- **`Max diff size (bytes)`** — drop-down `10000` / `50000` / `不限制` (default `10000`). The diff is
+  cut on real UTF-8 byte boundaries, never inside an emoji, and the truncation note counts towards the
+  budget.
+- **New setting `AI 分组摘要上限（字节）`** — drop-down `8000` / `20000` / `不限制` (default `8000`),
+  caps the change summary that `生成 stage` sends when it asks for a group.
+- **Every default is visible and editable**, including at the *Global for all repositories* level,
+  where unset values used to render as empty boxes.
+- **The default System prompt is Chinese**: one `类型: 修改描述` subject line (≤ 40 characters, no
+  trailing period, `feat`/`fix`/`refactor`/`docs`/`test` …).
+- **Staging safety**: staging goes through Git Extensions' own staging code and only for the files you
+  confirmed; the unstaged list is re-checked right before staging; a dialog can never stage into
+  another repository; deleted files are staged as deletions and untracked directories are expanded
+  into files.
+
 ## Build environment (quick reference)
 
 What the container that builds this project does, in order. A .NET 10 SDK plus a couple of system
@@ -151,7 +181,7 @@ covers the host's version. Because of that, a single build can't span generation
 
 | Git Extensions | Runtime | Extensibility | This plugin |
 | --- | --- | --- | --- |
-| **7.x** (current) | .NET 10 | `7.0.x` | **v0.5.2+** — depends on `[7.0.0, 8.0.0)` |
+| **7.x** (current) | .NET 10 | `7.0.x` | **v0.5.3+** — depends on `[7.0.0, 8.0.0)` |
 | 5.2.x | .NET 8 | `< 1.0` | v0.1.x (legacy, still on nuget.org) |
 
 The `[7.0.0, 8.0.0)` range means this release works across the **entire current 7.x line** — every
@@ -227,8 +257,8 @@ nuget.org **Trusted Publishing** (OIDC — no stored API key to manage). One-tim
 3. Tag a version and push it:
 
    ```sh
-   git tag v0.5.2
-   git push origin v0.5.2
+   git tag v0.5.3
+   git push origin v0.5.3
    ```
 
 The workflow fetches the matching Git Extensions binaries, packs the plugin, obtains a short-lived
@@ -239,7 +269,7 @@ To build the package locally instead:
 ```sh
 dotnet pack src/GitExtensions.AICommitMessage/GitExtensions.AICommitMessage.csproj -c Release
 # then, with your own key:
-dotnet nuget push src/GitExtensions.AICommitMessage/bin/Release/GitExtensions.AICommitMessage.0.5.2.nupkg \
+dotnet nuget push src/GitExtensions.AICommitMessage/bin/Release/GitExtensions.AICommitMessage.0.5.3.nupkg \
   -k <YOUR_NUGET_API_KEY> -s https://api.nuget.org/v3/index.json
 ```
 
