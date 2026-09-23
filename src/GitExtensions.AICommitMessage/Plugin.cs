@@ -30,6 +30,8 @@ namespace GitExtensions.AICommitMessage
         private const string Title = "AI commit message";
         private const string ButtonName = "aiCommitMessageButton";
         private const string ButtonText = "✨ AI message";
+        private const string AiCommitButtonName = "aiCommitStageButton";
+        private const string AiCommitButtonText = "🤖 AI commit";
 
         private const string DefaultSystemPrompt =
             "你是一名资深软件工程师，正在为暂存的 diff 编写 git 提交信息。\n" +
@@ -76,6 +78,16 @@ namespace GitExtensions.AICommitMessage
             new List<string>(MaxDiffSizeValues),
             "10000");
 
+        private static readonly string[] FeatureSummaryBytesValues = { "8000", "20000", UnlimitedDiffSizeLabel };
+
+        // Byte budget for the change summary that "AI commit" sends when it asks the model to pick one
+        // related group of changes.
+        private readonly ChoiceSetting _featureSummaryBytes = new(
+            "AI feature summary (bytes)",
+            "AI 分组摘要上限（字节）",
+            new List<string>(FeatureSummaryBytesValues),
+            "8000");
+
         // URL and API key use custom text boxes so changes can trigger model discovery. ChoiceSetting
         // supplies the model's native, non-editable ComboBox through Git Extensions' settings UI.
         private readonly TextBox _baseUrlControl = new() { Width = 320 };
@@ -120,6 +132,7 @@ namespace GitExtensions.AICommitMessage
             yield return _model;
             yield return _modelStatus;
             yield return _maxDiffSize;
+            yield return _featureSummaryBytes;
 
             // Show the system prompt in a tall, multi-line box so it's readable and editable.
             _systemPrompt.CustomControl = new TextBox
@@ -159,6 +172,13 @@ namespace GitExtensions.AICommitMessage
             _apiKeyControl.TextChanged -= OnModelSourceChanged;
             _baseUrlControl.TextChanged += OnModelSourceChanged;
             _apiKeyControl.TextChanged += OnModelSourceChanged;
+
+            // A failed earlier refresh leaves the list stale, which blocks both buttons. Re-arm the fetch
+            // so simply reopening the settings page can clear that state.
+            if (_modelListStale && !string.IsNullOrWhiteSpace(_baseUrlControl.Text))
+            {
+                _modelRefreshTimer.Start();
+            }
         }
 
         // Git Extensions hosts plugin settings at SettingLevel.Unknown (the AppSettings container), and
@@ -190,6 +210,13 @@ namespace GitExtensions.AICommitMessage
                 || !ApiTypeValues.Any(value => string.Equals(value, apiType.Trim(), StringComparison.OrdinalIgnoreCase)))
             {
                 _apiType[Settings] = ChatApiTypeLabel;
+            }
+
+            string? featureSummaryBytes = _featureSummaryBytes[Settings];
+            if (string.IsNullOrWhiteSpace(featureSummaryBytes)
+                || !FeatureSummaryBytesValues.Any(value => string.Equals(value, featureSummaryBytes.Trim(), StringComparison.Ordinal)))
+            {
+                _featureSummaryBytes[Settings] = "8000";
             }
 
             // An unset BoolSetting renders as a grey three-state box; store the default so the checkbox
@@ -345,10 +372,15 @@ namespace GitExtensions.AICommitMessage
                 : ChatApiTypeLabel;
         }
 
-        // Reads the byte budget from the dropdown: a number for the explicit limits, 0 for "不限制".
-        private int GetMaxDiffBytes()
+        // Reads the staged-diff byte budget: a number for the explicit limits, 0 for "不限制".
+        private int GetMaxDiffBytes() => ReadByteLimit(_maxDiffSize);
+
+        // Same semantics for the change summary sent to the grouping call.
+        private int GetFeatureSummaryBytes() => ReadByteLimit(_featureSummaryBytes);
+
+        private int ReadByteLimit(ChoiceSetting setting)
         {
-            string? value = _maxDiffSize.ValueOrDefault(Settings);
+            string? value = setting.ValueOrDefault(Settings);
             if (string.IsNullOrWhiteSpace(value)
                 || string.Equals(value.Trim(), UnlimitedDiffSizeLabel, StringComparison.Ordinal))
             {
@@ -356,37 +388,6 @@ namespace GitExtensions.AICommitMessage
             }
 
             return int.TryParse(value.Trim(), out int bytes) && bytes > 0 ? bytes : 0;
-        }
-
-        // Cuts the text so the UTF-8 byte count fits the budget without splitting a surrogate pair.
-        private static string TruncateToUtf8Bytes(string text, int maxBytes)
-        {
-            if (maxBytes <= 0 || Encoding.UTF8.GetByteCount(text) <= maxBytes)
-            {
-                return text;
-            }
-
-            int low = 0;
-            int high = text.Length;
-            while (low < high)
-            {
-                int mid = low + ((high - low + 1) / 2);
-                if (Encoding.UTF8.GetByteCount(text, 0, mid) <= maxBytes)
-                {
-                    low = mid;
-                }
-                else
-                {
-                    high = mid - 1;
-                }
-            }
-
-            if (low > 0 && char.IsHighSurrogate(text[low - 1]))
-            {
-                low--;
-            }
-
-            return text.Substring(0, low);
         }
 
         public override void Register(IGitUICommands gitUiCommands)
@@ -493,21 +494,41 @@ namespace GitExtensions.AICommitMessage
                 return;
             }
 
-            // Avoid adding a second button if this form was already processed.
-            if (host.Items.Cast<ToolStripItem>().Any(i => i.Name == ButtonName))
+            AddToolbarButton(
+                host,
+                insertIndex,
+                ButtonName,
+                ButtonText,
+                "Generate a commit message from the staged diff",
+                button => OnGenerateClickedAsync(form, button));
+
+            // Sits right next to the AI message button and drives the stage-then-generate flow.
+            AddToolbarButton(
+                host,
+                insertIndex < 0 ? -1 : insertIndex + 1,
+                AiCommitButtonName,
+                AiCommitButtonText,
+                "Pick one related change, stage it, then generate the commit message",
+                button => OnAiCommitClickedAsync(form, button));
+        }
+
+        private void AddToolbarButton(ToolStrip host, int insertIndex, string name, string text, string toolTip, Func<ToolStripButton, Task> onClick)
+        {
+            // Each button is added at most once - the idle hook can fire again for the same form.
+            if (host.Items.Cast<ToolStripItem>().Any(item => item.Name == name))
             {
                 return;
             }
 
             ToolStripButton button = new()
             {
-                Name = ButtonName,
-                Text = ButtonText,
+                Name = name,
+                Text = text,
                 Image = Icon,
                 DisplayStyle = ToolStripItemDisplayStyle.ImageAndText,
-                ToolTipText = "Generate a commit message from the staged diff"
+                ToolTipText = toolTip
             };
-            button.Click += async (_, _) => await OnGenerateClickedAsync(form, button).ConfigureAwait(true);
+            button.Click += async (_, _) => await onClick(button).ConfigureAwait(true);
 
             if (insertIndex >= 0 && insertIndex <= host.Items.Count)
             {
@@ -521,7 +542,7 @@ namespace GitExtensions.AICommitMessage
 
         private async Task OnGenerateClickedAsync(Form form, ToolStripButton button)
         {
-            string? workingDir = _module?.WorkingDir;
+            string? workingDir = GetDialogModule(form)?.WorkingDir;
             if (string.IsNullOrEmpty(workingDir))
             {
                 return;
@@ -540,18 +561,18 @@ namespace GitExtensions.AICommitMessage
 
             if (string.IsNullOrWhiteSpace(model))
             {
-                MessageBox.Show(form,
+                ShowMessage(form,
                     "请先填写 API URL 和 API Key，等待模型列表加载后选择一个模型。",
-                    Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBoxIcon.Information);
                 return;
             }
 
             if (_modelListStale)
             {
-                MessageBox.Show(form,
+                ShowMessage(form,
                     "模型列表尚未成功获取：API URL 或 API Key 已更改。\n\n"
                     + "请打开 设置 → 插件 → AI Commit Message，确认模型列表已加载后再生成。",
-                    Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBoxIcon.Information);
                 return;
             }
 
@@ -564,29 +585,386 @@ namespace GitExtensions.AICommitMessage
             {
                 // Off the UI thread; the continuation resumes on the UI thread to update the form.
                 string message = await Task.Run(() => GenerateAsync(workingDir!, baseUrl, apiKey, model, systemPrompt, maxDiffBytes, apiType));
-                if (!string.IsNullOrEmpty(message))
+                if (form.IsDisposed || button.IsDisposed)
                 {
-                    SetCommitMessage(form, message);
+                    return;
+                }
+
+                if (!string.IsNullOrEmpty(message) && !SetCommitMessage(form, message))
+                {
+                    ShowGeneratedMessage(form, message);
                 }
             }
             catch (NoStagedChangesException)
             {
-                MessageBox.Show(form,
+                ShowMessage(form,
                     "No staged changes were found. Stage the files you want to commit, then click again.",
-                    Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
-                MessageBox.Show(form,
+                ShowMessage(form,
                     "Failed to generate a commit message:\n\n" + ex.Message,
-                    Title, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBoxIcon.Error);
             }
             finally
             {
-                button.Text = originalText;
-                button.Enabled = true;
+                if (!button.IsDisposed)
+                {
+                    button.Text = originalText;
+                    button.Enabled = true;
+                }
             }
         }
+
+        /// <summary>
+        /// "AI commit": let the model pick one related group out of the unstaged changes, confirm the file
+        /// list with the user, stage exactly those files, refresh the dialog and fill in the commit message.
+        /// Nothing is ever committed automatically.
+        /// </summary>
+        private async Task OnAiCommitClickedAsync(Form form, ToolStripButton button)
+        {
+            // The dialog knows which repository it belongs to; _module is only the last one registered,
+            // so with several repository windows open it can point somewhere else entirely.
+            IGitModule? module = GetDialogModule(form);
+            string? workingDir = module?.WorkingDir;
+            if (module is null || string.IsNullOrEmpty(workingDir))
+            {
+                return;
+            }
+
+            // Read settings on the UI thread.
+            string baseUrl = _baseUrl.ValueOrDefault(Settings) ?? string.Empty;
+            string model = _model.ValueOrDefault(Settings) ?? string.Empty;
+            string apiKey = _apiKey.ValueOrDefault(Settings) ?? string.Empty;
+            string apiType = GetApiType();
+            string systemPrompt = _systemPrompt.ValueOrDefault(Settings) ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(systemPrompt))
+            {
+                systemPrompt = DefaultSystemPrompt;
+            }
+
+            if (string.IsNullOrWhiteSpace(model))
+            {
+                ShowMessage(form,
+                    "请先填写 API URL 和 API Key，等待模型列表加载后选择一个模型。",
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            if (_modelListStale)
+            {
+                ShowMessage(form,
+                    "模型列表尚未成功获取：API URL 或 API Key 已更改。\n\n"
+                    + "请打开 设置 → 插件 → AI Commit Message，确认模型列表已加载后再使用 AI commit。",
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            string? originalText = button.Text;
+            button.Enabled = false;
+            button.Text = "Analyzing…";
+            try
+            {
+                int summaryBytes = GetFeatureSummaryBytes();
+                ChangeSet changeSet = await Task.Run(() => GitHelper.GetChangeSet(workingDir!, summaryBytes)).ConfigureAwait(true);
+                if (form.IsDisposed || button.IsDisposed)
+                {
+                    return;
+                }
+
+                if (changeSet.UnstagedPaths.Count == 0)
+                {
+                    ShowMessage(form, "没有未暂存的改动可供分组。请先修改文件，再点 🤖 AI commit。", MessageBoxIcon.Information);
+                    return;
+                }
+
+                // Canonical spelling of every candidate: a differently-cased answer from the model must
+                // never stage a path that the confirmation dialog did not list.
+                Dictionary<string, string> candidates = new(StringComparer.OrdinalIgnoreCase);
+                foreach (string path in changeSet.UnstagedPaths)
+                {
+                    candidates[path] = path;
+                }
+
+                List<string> chosen;
+                string feature;
+                string reason;
+                try
+                {
+                    OpenAiClient client = new(baseUrl, apiKey, model, apiType);
+                    FeatureSelection selection = await client
+                        .SelectFeatureAsync(changeSet.Summary, changeSet.UnstagedPaths)
+                        .ConfigureAwait(true);
+                    if (form.IsDisposed || button.IsDisposed)
+                    {
+                        return;
+                    }
+
+                    chosen = selection.Files
+                        .Select(file => candidates.TryGetValue(file, out string? canonical) ? canonical : null)
+                        .Where(path => path is not null)
+                        .Select(path => path!)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                    feature = selection.Feature;
+                    reason = selection.Reason;
+                }
+                catch (Exception ex)
+                {
+                    if (form.IsDisposed || button.IsDisposed)
+                    {
+                        return;
+                    }
+
+                    // Never stage everything silently: the fallback needs an explicit yes.
+                    if (!AskYesNo(form,
+                        "AI 未能挑出改动分组：\n\n" + ex.Message + "\n\n是否改为暂存全部未暂存文件？",
+                        MessageBoxIcon.Warning))
+                    {
+                        return;
+                    }
+
+                    chosen = changeSet.UnstagedPaths.ToList();
+                    feature = "全部未暂存改动";
+                    reason = "AI 分组失败，由用户选择暂存全部未暂存文件。";
+                }
+
+                if (chosen.Count == 0)
+                {
+                    ShowMessage(form,
+                        "AI 没有挑出可暂存的改动（它返回的路径都不在未暂存清单里）。\n\n"
+                        + "功能：" + feature + "\n原因：" + reason,
+                        MessageBoxIcon.Information);
+                    return;
+                }
+
+                if (!ConfirmStaging(form, feature, reason, chosen))
+                {
+                    return;
+                }
+
+                // The work tree may have changed while the model was answering (or while the dialog sat
+                // open), so re-read it and only stage paths that are still unstaged right now.
+                IReadOnlyList<string> stillUnstaged = await Task.Run(
+                    () => (IReadOnlyList<string>)GitHelper.GetChangedFiles(workingDir!)
+                        .Where(entry => entry.HasUnstagedChanges)
+                        .Select(entry => entry.Path)
+                        .ToList()).ConfigureAwait(true);
+                if (form.IsDisposed || button.IsDisposed)
+                {
+                    return;
+                }
+
+                HashSet<string> currentPaths = new(stillUnstaged, StringComparer.OrdinalIgnoreCase);
+                List<string> stageable = chosen.Where(currentPaths.Contains).ToList();
+                if (stageable.Count != chosen.Count)
+                {
+                    ShowMessage(form,
+                        "以下文件在确认之后已不再是未暂存状态，将被跳过：\n\n"
+                        + string.Join(Environment.NewLine, chosen.Where(path => !currentPaths.Contains(path))),
+                        MessageBoxIcon.Information);
+                }
+
+                if (stageable.Count == 0)
+                {
+                    ShowMessage(form, "需要暂存的文件都已不再处于未暂存状态，请刷新后重试。", MessageBoxIcon.Information);
+                    return;
+                }
+
+                button.Text = "Staging…";
+                IReadOnlyList<GitItemStatus>? knownItems = GetUnstagedItems(form);
+
+                // Staged on the UI thread on purpose: this is exactly what the dialog's own stage buttons
+                // do, so the index write cannot race a concurrent rescan.
+                string stageOutput = string.Empty;
+                bool staged = StageSelection(module, changeSet, knownItems, stageable, out stageOutput);
+                bool refreshed = RescanCommitForm(form);
+                if (!staged)
+                {
+                    // git may have updated the index before reporting an error, so refresh either way.
+                    ShowMessage(form, "暂存失败：\n\n" + stageOutput, MessageBoxIcon.Error);
+                    return;
+                }
+
+                if (!refreshed)
+                {
+                    ShowMessage(form,
+                        "文件已暂存，但未能刷新提交对话框；请按 F5 刷新列表后继续。",
+                        MessageBoxIcon.Information);
+                }
+
+                button.Text = "Generating…";
+                int maxDiffBytes = GetMaxDiffBytes();
+                string message = await Task.Run(() => GenerateAsync(
+                    workingDir!, baseUrl, apiKey, model, systemPrompt, maxDiffBytes, apiType)).ConfigureAwait(true);
+                if (form.IsDisposed || button.IsDisposed)
+                {
+                    return;
+                }
+
+                if (!string.IsNullOrEmpty(message) && !SetCommitMessage(form, message))
+                {
+                    ShowGeneratedMessage(form, message);
+                }
+            }
+            catch (NoStagedChangesException)
+            {
+                ShowMessage(form, "暂存后没有可读取的改动，无法生成提交信息。", MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                ShowMessage(form, "AI commit 失败：\n\n" + ex.Message, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                if (!button.IsDisposed)
+                {
+                    button.Text = originalText;
+                    button.Enabled = true;
+                }
+            }
+        }
+
+        // Reads the commit dialog's unstaged list through reflection (the plugin has no reference to
+        // GitUI). Returns null when the layout is unknown; the caller then stages plain paths instead.
+        private static IReadOnlyList<GitItemStatus>? GetUnstagedItems(Form form)
+        {
+            object? list = GetMember(form, "Unstaged");
+            if (list is null)
+            {
+                return null;
+            }
+
+            PropertyInfo? property = list.GetType().GetProperty(
+                "GitItemStatuses", BindingFlags.Instance | BindingFlags.Public);
+            return property?.GetValue(list) as IReadOnlyList<GitItemStatus>;
+        }
+
+        // Stages exactly the confirmed paths through Git Extensions' own staging code, so its index
+        // bookkeeping and submodule handling stay consistent. Paths never reach a shell.
+        private static bool StageSelection(
+            IGitModule module,
+            ChangeSet changeSet,
+            IReadOnlyList<GitItemStatus>? knownItems,
+            IReadOnlyList<string> chosen,
+            out string output)
+        {
+            output = string.Empty;
+            List<GitItemStatus> items = new();
+            foreach (string path in chosen)
+            {
+                // Exact match only: the dialog's item carries IsDeleted/IsNew, which decide whether the
+                // index update has to remove the entry instead of adding it.
+                GitItemStatus? match = knownItems?.FirstOrDefault(
+                    item => string.Equals(item.Name, path, StringComparison.Ordinal));
+                if (match is not null)
+                {
+                    items.Add(match);
+                    continue;
+                }
+
+                GitItemStatus item = new(path);
+                StatusEntry? entry = changeSet.UnstagedEntries.FirstOrDefault(
+                    candidate => string.Equals(candidate.Path, path, StringComparison.OrdinalIgnoreCase));
+                if (entry?.IsDeletedInWorkTree == true)
+                {
+                    item.IsDeleted = true;
+                }
+
+                items.Add(item);
+            }
+
+            if (items.Count == 0)
+            {
+                output = "没有要暂存的文件。";
+                return false;
+            }
+
+            return module.StageFiles(items, out output);
+        }
+
+        // FormCommit refreshes its staged/unstaged lists through this private method.
+        private static bool RescanCommitForm(Form form)
+        {
+            MethodInfo? rescan = form.GetType().GetMethod(
+                "RescanChanges",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public,
+                binder: null, types: Type.EmptyTypes, modifiers: null);
+            if (rescan is null)
+            {
+                return false;
+            }
+
+            rescan.Invoke(form, null);
+            return true;
+        }
+
+        // Shows exactly which files are about to be staged, before the index is touched.
+        private static bool ConfirmStaging(Form owner, string feature, string reason, IReadOnlyList<string> files)
+        {
+            using Form dialog = new()
+            {
+                Text = "AI commit - 确认暂存内容",
+                StartPosition = FormStartPosition.CenterParent,
+                MinimizeBox = false,
+                MaximizeBox = false,
+                ShowInTaskbar = false,
+                ClientSize = new Size(680, 460)
+            };
+
+            Label header = new()
+            {
+                Dock = DockStyle.Top,
+                Height = 72,
+                Padding = new Padding(10),
+                Text = "功能：" + feature + Environment.NewLine + "原因：" + reason
+            };
+
+            ListBox list = new()
+            {
+                Dock = DockStyle.Fill,
+                IntegralHeight = false,
+                HorizontalScrollbar = true,
+                SelectionMode = SelectionMode.None
+            };
+            foreach (string file in files)
+            {
+                list.Items.Add(file);
+            }
+
+            FlowLayoutPanel buttons = new()
+            {
+                Dock = DockStyle.Bottom,
+                FlowDirection = FlowDirection.RightToLeft,
+                Height = 48,
+                Padding = new Padding(8)
+            };
+
+            Button confirm = new()
+            {
+                Text = $"暂存并生成信息（{files.Count} 个文件）",
+                DialogResult = DialogResult.OK,
+                AutoSize = true
+            };
+            Button cancel = new()
+            {
+                Text = "取消",
+                DialogResult = DialogResult.Cancel,
+                AutoSize = true
+            };
+            buttons.Controls.Add(cancel);
+            buttons.Controls.Add(confirm);
+
+            dialog.Controls.Add(list);
+            dialog.Controls.Add(header);
+            dialog.Controls.Add(buttons);
+            dialog.AcceptButton = confirm;
+            dialog.CancelButton = cancel;
+
+            return dialog.ShowDialog(owner) == DialogResult.OK;
+        }
+
 
         private static async Task<string> GenerateAsync(string workingDir, string baseUrl, string apiKey, string model, string systemPrompt, int maxDiffBytes, string apiType)
         {
@@ -598,8 +976,12 @@ namespace GitExtensions.AICommitMessage
 
             if (maxDiffBytes > 0 && Encoding.UTF8.GetByteCount(diff) > maxDiffBytes)
             {
-                diff = TruncateToUtf8Bytes(diff, maxDiffBytes)
-                    + "\n\n[diff truncated to fit the configured byte limit]";
+                // Keep the note inside the configured budget instead of adding it on top.
+                const string truncationNote = "\n\n[diff truncated to fit the configured byte limit]";
+                int noteBytes = Encoding.UTF8.GetByteCount(truncationNote);
+                diff = noteBytes < maxDiffBytes
+                    ? GitHelper.TruncateToUtf8Bytes(diff, maxDiffBytes - noteBytes) + truncationNote
+                    : GitHelper.TruncateToUtf8Bytes(diff, maxDiffBytes);
             }
 
             OpenAiClient client = new(baseUrl, apiKey, model, apiType);
@@ -607,7 +989,8 @@ namespace GitExtensions.AICommitMessage
         }
 
         // Sets the commit message using FormCommit's own ReplaceMessage(string), falling back to Message.Text.
-        private static void SetCommitMessage(Form form, string message)
+        // Returns false when neither exists, so the caller can show the text instead of losing it.
+        private static bool SetCommitMessage(Form form, string message)
         {
             MethodInfo? replace = form.GetType().GetMethod(
                 "ReplaceMessage",
@@ -616,15 +999,44 @@ namespace GitExtensions.AICommitMessage
             if (replace is not null)
             {
                 replace.Invoke(form, new object[] { message });
-                return;
+                return true;
             }
 
             if (GetMember(form, "Message") is Control messageControl)
             {
                 messageControl.Text = message;
                 messageControl.Focus();
+                return true;
             }
+
+            return false;
         }
+
+        // The message cost a real API call: show it rather than dropping it silently.
+        private static void ShowGeneratedMessage(Form owner, string message)
+            => MessageBox.Show(
+                owner.IsDisposed ? null : owner,
+                "无法把生成的信息写入提交框（宿主界面可能已变化），请手动复制：\n\n" + message,
+                Title,
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+
+        // The dialog belongs to a specific repository, so ask it instead of trusting the last registered
+        // plugin instance (_module), which can belong to a different repository window.
+        private IGitModule? GetDialogModule(Form form)
+        {
+            PropertyInfo? module = form.GetType().GetProperty(
+                "Module", BindingFlags.Instance | BindingFlags.Public);
+            return module?.GetValue(form) as IGitModule ?? _module;
+        }
+
+        // Dialog helpers that tolerate the dialog being closed while a model call was in flight.
+        private static void ShowMessage(Form owner, string text, MessageBoxIcon icon)
+            => MessageBox.Show(owner.IsDisposed ? null : owner, text, Title, MessageBoxButtons.OK, icon);
+
+        private static bool AskYesNo(Form owner, string text, MessageBoxIcon icon)
+            => MessageBox.Show(
+                owner.IsDisposed ? null : owner, text, Title, MessageBoxButtons.YesNo, icon) == DialogResult.Yes;
 
         private static object? GetMember(Form form, string name)
         {

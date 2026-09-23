@@ -82,6 +82,70 @@ namespace GitExtensions.AICommitMessage
             return models;
         }
 
+        private const string FeatureSelectionInstructions =
+            "你是资深软件工程师。下面是某个 git 仓库当前的改动清单：STAGED 表示已经暂存，UNSTAGED 表示尚未暂存。\n" +
+            "请从 UNSTAGED 中挑出一组属于**同一个功能**的改动，供一次提交使用。\n" +
+            "规则：\n" +
+            "- 只能从 UNSTAGED 里挑文件，绝不能挑 STAGED 里的文件。\n" +
+            "- 优先选择调用链或功能上彼此相关的文件；如果确实只有一处改动相关，就只选它。\n" +
+            "- 至少选 1 个文件，宁少勿滥；路径必须与清单中给出的字符串完全一致。\n" +
+            "- feature：用中文一句话概括这个功能，最多 20 个字，不加句号。\n" +
+            "- reason：用中文说明为什么这些改动属于同一个功能，最多 80 个字。\n" +
+            "- 只输出一个 JSON 对象，不要 markdown，不要代码围栏，前后不要任何解释文字：\n" +
+            "{\"feature\":\"...\",\"files\":[\"路径1\",\"路径2\"],\"reason\":\"...\"}";
+
+        /// <summary>
+        /// Asks the model to pick one related group out of the unstaged changes. Uses whichever API the
+        /// caller configured, exactly like <see cref="CompleteAsync"/> does.
+        /// </summary>
+        /// <param name="knownPaths">
+        /// The real candidate paths. When given, the JSON object whose "files" match them best wins, so an
+        /// echoed example from the instructions cannot be mistaken for the answer.
+        /// </param>
+        public async Task<FeatureSelection> SelectFeatureAsync(
+            string changeSummary,
+            IReadOnlyList<string>? knownPaths = null,
+            CancellationToken cancellationToken = default)
+        {
+            EnsureBaseUrl();
+            EnsureModel();
+
+            string responseText = _useResponseApi
+                ? await PostAsync(
+                    "/responses",
+                    JsonSerializer.Serialize(new
+                    {
+                        model = _model,
+                        instructions = FeatureSelectionInstructions,
+                        input = changeSummary
+                    }),
+                    cancellationToken).ConfigureAwait(false)
+                : await PostAsync(
+                    "/chat/completions",
+                    JsonSerializer.Serialize(new
+                    {
+                        model = _model,
+                        temperature = 0.2,
+                        messages = new object[]
+                        {
+                            new { role = "system", content = FeatureSelectionInstructions },
+                            new { role = "user", content = changeSummary }
+                        }
+                    }),
+                    cancellationToken).ConfigureAwait(false);
+
+            string content = _useResponseApi
+                ? ExtractResponseContent(responseText)
+                : ExtractChatContent(responseText);
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                throw new InvalidOperationException(
+                    "模型返回的内容为空，无法进行分组：\n\n" + Truncate(responseText, 1000));
+            }
+
+            return FeatureSelection.Parse(content, knownPaths);
+        }
+
         public async Task<string> CompleteAsync(string systemPrompt, string diff, CancellationToken cancellationToken = default)
         {
             EnsureBaseUrl();
@@ -222,7 +286,8 @@ namespace GitExtensions.AICommitMessage
             {
                 JsonElement first = choices[0];
                 if (first.TryGetProperty("message", out JsonElement message)
-                    && message.TryGetProperty("content", out JsonElement content))
+                    && message.TryGetProperty("content", out JsonElement content)
+                    && content.ValueKind == JsonValueKind.String)
                 {
                     return content.GetString()?.Trim() ?? string.Empty;
                 }
@@ -232,7 +297,220 @@ namespace GitExtensions.AICommitMessage
                 "Unexpected API response shape (no choices[0].message.content):\n\n" + Truncate(responseText, 1000));
         }
 
-        private static string Truncate(string s, int max)
+        internal static string Truncate(string s, int max)
             => string.IsNullOrEmpty(s) || s.Length <= max ? s : s.Substring(0, max) + "…";
+    }
+
+    /// <summary>The one group of changes the model picked out of the unstaged files.</summary>
+    internal sealed class FeatureSelection
+    {
+        private FeatureSelection(string feature, string reason, IReadOnlyList<string> files)
+        {
+            Feature = feature;
+            Reason = reason;
+            Files = files;
+        }
+
+        /// <summary>Short human-readable name of the feature, e.g. "模型下拉与接口类型".</summary>
+        public string Feature { get; }
+
+        /// <summary>Why the model thinks these files belong together.</summary>
+        public string Reason { get; }
+
+        /// <summary>Paths the model selected; still unvalidated against the real change set.</summary>
+        public IReadOnlyList<string> Files { get; }
+
+        /// <summary>
+        /// Tolerant parser: models like to wrap JSON in ``` fences or add a sentence around it, so the
+        /// first balanced JSON object inside the reply is used.
+        /// </summary>
+        public static FeatureSelection Parse(string responseText, IReadOnlyList<string>? knownPaths = null)
+        {
+            string text = responseText ?? string.Empty;
+
+            // Models sometimes restate the example from the instructions before sending the real answer,
+            // so the object whose "files" match the real candidates best wins; without candidates the first
+            // object that carries "files" does.
+            string chosenJson = string.Empty;
+            string fallbackJson = string.Empty;
+            int bestScore = -1;
+            foreach (string candidate in ExtractJsonObjects(text))
+            {
+                try
+                {
+                    using JsonDocument probe = JsonDocument.Parse(candidate);
+                    if (probe.RootElement.ValueKind != JsonValueKind.Object)
+                    {
+                        continue;
+                    }
+
+                    if (!probe.RootElement.TryGetProperty("files", out _))
+                    {
+                        if (fallbackJson.Length == 0)
+                        {
+                            fallbackJson = candidate;
+                        }
+
+                        continue;
+                    }
+
+                    int score = ScoreFiles(probe.RootElement, knownPaths);
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        chosenJson = candidate;
+                    }
+                }
+                catch (JsonException)
+                {
+                    // Balanced braces that are not valid JSON; keep looking.
+                }
+            }
+
+            if (chosenJson.Length == 0)
+            {
+                chosenJson = fallbackJson;
+            }
+
+            if (chosenJson.Length == 0)
+            {
+                throw new InvalidOperationException(
+                    "模型没有返回可用于分组的 JSON 对象：\n\n" + OpenAiClient.Truncate(text, 1000));
+            }
+
+            using JsonDocument doc = JsonDocument.Parse(chosenJson);
+            JsonElement root = doc.RootElement;
+
+            string feature = root.TryGetProperty("feature", out JsonElement featureElement)
+                && featureElement.ValueKind == JsonValueKind.String
+                    ? featureElement.GetString()?.Trim() ?? string.Empty
+                    : string.Empty;
+
+            string reason = root.TryGetProperty("reason", out JsonElement reasonElement)
+                && reasonElement.ValueKind == JsonValueKind.String
+                    ? reasonElement.GetString()?.Trim() ?? string.Empty
+                    : string.Empty;
+
+            List<string> files = new();
+            if (root.TryGetProperty("files", out JsonElement filesElement) && filesElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (JsonElement item in filesElement.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.String)
+                    {
+                        continue;
+                    }
+
+                    string? path = item.GetString()?.Trim().Replace('\\', '/');
+                    if (string.IsNullOrWhiteSpace(path) || files.Contains(path, StringComparer.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    files.Add(path);
+                }
+            }
+
+            return new FeatureSelection(
+                string.IsNullOrWhiteSpace(feature) ? "未命名功能" : feature,
+                reason,
+                files);
+        }
+
+        // How many of the object's "files" are real candidates; 0 when there is nothing to compare with.
+        private static int ScoreFiles(JsonElement root, IReadOnlyList<string>? knownPaths)
+        {
+            if (knownPaths is null || knownPaths.Count == 0
+                || !root.TryGetProperty("files", out JsonElement files)
+                || files.ValueKind != JsonValueKind.Array)
+            {
+                return 0;
+            }
+
+            HashSet<string> known = new(knownPaths, StringComparer.OrdinalIgnoreCase);
+            int score = 0;
+            foreach (JsonElement item in files.EnumerateArray())
+            {
+                string? path = item.ValueKind == JsonValueKind.String
+                    ? item.GetString()?.Replace('\\', '/').Trim()
+                    : null;
+                if (path is not null && known.Contains(path))
+                {
+                    score++;
+                }
+            }
+
+            return score;
+        }
+
+        private static IEnumerable<string> ExtractJsonObjects(string text)
+        {
+            int index = 0;
+            while (index < text.Length)
+            {
+                int start = text.IndexOf('{', index);
+                if (start < 0)
+                {
+                    yield break;
+                }
+
+                string? candidate = ReadBalancedObject(text, start);
+                if (candidate is null)
+                {
+                    yield break;
+                }
+
+                yield return candidate;
+                index = start + candidate.Length;
+            }
+        }
+
+        private static string? ReadBalancedObject(string text, int start)
+        {
+            int depth = 0;
+            bool inString = false;
+            bool escaped = false;
+            for (int i = start; i < text.Length; i++)
+            {
+                char c = text[i];
+                if (inString)
+                {
+                    if (escaped)
+                    {
+                        escaped = false;
+                    }
+                    else if (c == '\\')
+                    {
+                        escaped = true;
+                    }
+                    else if (c == '"')
+                    {
+                        inString = false;
+                    }
+
+                    continue;
+                }
+
+                switch (c)
+                {
+                    case '"':
+                        inString = true;
+                        break;
+                    case '{':
+                        depth++;
+                        break;
+                    case '}':
+                        depth--;
+                        if (depth == 0)
+                        {
+                            return text.Substring(start, i - start + 1);
+                        }
+
+                        break;
+                }
+            }
+
+            return null;
+        }
     }
 }
