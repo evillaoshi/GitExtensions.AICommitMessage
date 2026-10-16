@@ -90,17 +90,27 @@ namespace GitExtensions.AICommitMessage
 
         // URL and API key use custom text boxes so changes can trigger model discovery. ChoiceSetting
         // supplies the model's native, non-editable ComboBox through Git Extensions' settings UI.
-        private readonly TextBox _baseUrlControl = new() { Width = 320 };
-        private readonly TextBox _apiKeyControl = new() { Width = 320, UseSystemPasswordChar = true };
-        private readonly Label _modelStatusControl = new()
-        {
-            AutoSize = true,
-            Text = "模型状态：尚未获取模型列表。"
-        };
-        private readonly PseudoSetting _modelStatus;
+        //
+        // Git Extensions puts these controls on the settings page and disposes them together with that
+        // dialog, while this plugin instance (and every setting object it owns) outlives the dialog.
+        // ConfigureSettingsControls therefore builds a fresh set for every settings page: handing a
+        // disposed control back would make the host recreate it, which is impossible for a PseudoSetting
+        // that was built from an existing control (it has no TextBoxCreator, so the host throws
+        // "Value cannot be null. (Parameter 'Setting.TextBoxCreator')"), and the URL/key boxes would
+        // silently lose the change handlers that trigger model discovery.
+        private TextBox _baseUrlControl = CreateUrlTextBox();
+        private TextBox _apiKeyControl = CreateApiKeyTextBox();
+        private Label _modelStatusControl = CreateModelStatusLabel();
+        private PseudoSetting _modelStatus;
         private readonly ToolTip _modelToolTip = new();
         private readonly System.Windows.Forms.Timer _modelRefreshTimer = new() { Interval = 700 };
         private CancellationTokenSource? _modelRefreshCancellation;
+
+        private static TextBox CreateUrlTextBox() => new() { Width = 320 };
+
+        private static TextBox CreateApiKeyTextBox() => new() { Width = 320, UseSystemPasswordChar = true };
+
+        private static Label CreateModelStatusLabel() => new() { AutoSize = true };
 
         // True while the API URL or key has been edited without a successful model list load since.
         // Generation is refused in that window so a model from the previous endpoint is never sent.
@@ -153,6 +163,12 @@ namespace GitExtensions.AICommitMessage
         private void ConfigureSettingsControls()
         {
             EnsureSettingDefaults();
+
+            // Fresh controls for this settings page; the previous page's controls are gone.
+            _baseUrlControl = CreateUrlTextBox();
+            _apiKeyControl = CreateApiKeyTextBox();
+            _modelStatusControl = CreateModelStatusLabel();
+            _modelStatus = new PseudoSetting(_modelStatusControl, "Model status");
 
             _baseUrl.CustomControl = _baseUrlControl;
             _apiKey.CustomControl = _apiKeyControl;
@@ -290,7 +306,7 @@ namespace GitExtensions.AICommitMessage
                 PopulateModelValues(models, preferredModel);
                 _modelListStale = false;
                 SetModelStatus($"模型状态：已获取 {models.Count} 个可用模型。");
-                if (_model.CustomControl is ComboBox modelControl)
+                if (_model.CustomControl is ComboBox modelControl && !modelControl.IsDisposed)
                 {
                     _modelToolTip.SetToolTip(modelControl, $"已获取 {models.Count} 个可用模型。");
                 }
@@ -312,7 +328,7 @@ namespace GitExtensions.AICommitMessage
                 if (!cancellation.IsCancellationRequested)
                 {
                     SetModelStatus("模型状态：获取失败：" + ex.Message);
-                    if (_model.CustomControl is ComboBox modelControl)
+                    if (_model.CustomControl is ComboBox modelControl && !modelControl.IsDisposed)
                     {
                         _modelToolTip.SetToolTip(modelControl, "获取模型失败：" + ex.Message);
                     }
@@ -345,7 +361,7 @@ namespace GitExtensions.AICommitMessage
             _modelValues.Clear();
             _modelValues.AddRange(values);
 
-            if (_model.CustomControl is ComboBox modelControl)
+            if (_model.CustomControl is ComboBox modelControl && !modelControl.IsDisposed)
             {
                 modelControl.BeginUpdate();
                 try
